@@ -40,9 +40,9 @@ jobs:
             output: columnar.so
             test: true
           - os: ubuntu-22.04-arm
-            container: alpine:latest
             artifact: columnar-linux-musl-arm64
             output: columnar.so
+            musl_docker: true
             test: true
           - os: macos-15
             artifact: columnar-macos-universal
@@ -133,8 +133,17 @@ jobs:
           add-to-path: false
 
       - name: build desktop extension
-        if: ${{ !matrix.android_abi && !matrix.apple_sdk && runner.os != 'Windows' }}
+        if: ${{ !matrix.android_abi && !matrix.apple_sdk && !matrix.musl_docker && runner.os != 'Windows' }}
         run: make extension ${{ matrix.make_args || '' }}
+
+      - name: build and test Linux musl arm64 extension
+        if: matrix.musl_docker
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            alpine:latest \
+            sh -lc 'apk add --no-cache build-base sqlite git zlib-dev && make clean extension test && sqlite3 :memory: ".load ./dist/columnar" "SELECT columnar_version();"'
 
       - name: build Windows extension
         if: runner.os == 'Windows'
@@ -165,7 +174,7 @@ jobs:
             -dynamiclib columnar.c -o dist/columnar.dylib
 
       - name: test extension
-        if: matrix.test && runner.os != 'Windows'
+        if: matrix.test && !matrix.musl_docker && runner.os != 'Windows'
         run: make test ${{ matrix.make_args || '' }}
 
       - name: test Windows extension
@@ -174,7 +183,7 @@ jobs:
         run: make test
 
       - name: smoke load built artifact
-        if: matrix.test && runner.os != 'Windows'
+        if: matrix.test && !matrix.musl_docker && runner.os != 'Windows'
         run: 'sqlite3 :memory: ".load ./dist/columnar" "SELECT columnar_version();"'
 
       - name: smoke load Windows artifact
