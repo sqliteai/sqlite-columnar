@@ -8,6 +8,16 @@ on:
       - "*.*.*"
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Optional tag/version to release after successful builds, for example 1.0.0. Leave empty for build-only."
+        required: false
+        type: string
+      prerelease:
+        description: "Mark a manual release as prerelease."
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: sqlite-columnar-${{ github.workflow }}-${{ github.ref }}
@@ -192,7 +202,7 @@ jobs:
         run: 'sqlite3 :memory: ".load ./dist/columnar" "SELECT columnar_version();"'
 
       - name: validate macOS signing secrets
-        if: startsWith(github.ref, 'refs/tags/') && matrix.notarize
+        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) && matrix.notarize
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
@@ -212,7 +222,7 @@ jobs:
           exit "$missing"
 
       - name: create keychain for macOS codesign
-        if: startsWith(github.ref, 'refs/tags/') && matrix.notarize
+        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) && matrix.notarize
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
@@ -231,7 +241,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
       - name: codesign macOS dylib
-        if: startsWith(github.ref, 'refs/tags/') && matrix.notarize
+        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) && matrix.notarize
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
@@ -247,14 +257,18 @@ jobs:
           printf "%s\n" "${{ github.sha }}" > package/GIT_COMMIT
 
       - name: notarize macOS release archive
-        if: startsWith(github.ref, 'refs/tags/') && matrix.notarize
+        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) && matrix.notarize
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            VERSION="$GITHUB_REF_NAME"
+          else
+            VERSION="${{ github.event.inputs.release_version }}"
+          fi
           RELEASE_DIR="release/${{ matrix.artifact }}-${VERSION}"
           RELEASE_ZIP="release/${{ matrix.artifact }}-${VERSION}.zip"
           mkdir -p "$RELEASE_DIR"
@@ -263,13 +277,13 @@ jobs:
           xcrun notarytool submit "$RELEASE_ZIP" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
 
       - name: cleanup macOS signing keychain
-        if: always() && startsWith(github.ref, 'refs/tags/') && matrix.notarize
+        if: always() && (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) && matrix.notarize
         run: |
           rm -f "$RUNNER_TEMP/developer_id_application.p12"
           security delete-keychain "$RUNNER_TEMP/columnar-signing.keychain-db" || true
 
       - uses: actions/upload-artifact@v4.6.2
-        if: startsWith(github.ref, 'refs/tags/') && matrix.notarize
+        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) && matrix.notarize
         with:
           name: ${{ matrix.artifact }}
           path: release/*.zip
@@ -277,7 +291,7 @@ jobs:
           retention-days: 14
 
       - uses: actions/upload-artifact@v4.6.2
-        if: ${{ !startsWith(github.ref, 'refs/tags/') || !matrix.notarize }}
+        if: ${{ !(startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) || !matrix.notarize }}
         with:
           name: ${{ matrix.artifact }}
           path: package/
@@ -285,12 +299,23 @@ jobs:
           retention-days: 14
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')
     needs: build
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
+      - name: resolve release version
+        id: release
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            VERSION="$GITHUB_REF_NAME"
+          else
+            VERSION="${{ github.event.inputs.release_version }}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - uses: actions/download-artifact@v4.2.1
         with:
           path: artifacts
@@ -298,7 +323,7 @@ jobs:
       - name: package release archives
         run: |
           set -e
-          VERSION="${GITHUB_REF_NAME}"
+          VERSION="${{ steps.release.outputs.version }}"
           mkdir -p release
           for dir in artifacts/columnar-*; do
             name="$(basename "$dir")"
@@ -312,6 +337,10 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prerelease == 'true' }}
           files: |
             release/*.zip
             release/*.tar.gz

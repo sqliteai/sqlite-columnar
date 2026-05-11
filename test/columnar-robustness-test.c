@@ -12,8 +12,10 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 static void fatal(sqlite3 *db, const char *zMsg, int rc){
   fprintf(stderr, "%s: %s (%d)\n", zMsg, db ? sqlite3_errmsg(db) : "", rc);
@@ -320,6 +322,7 @@ static void test_api_fuzz(sqlite3 *db){
   expect_error(db, "wrong table type", "SELECT columnar_count(123,'v')");
 }
 
+#ifndef _WIN32
 static void create_crash_db(const char *zDb, const char *zExt){
   sqlite3 *db = 0;
   unlink(zDb);
@@ -375,6 +378,7 @@ static void test_crash_recovery(const char *zExt){
   close_db(db);
   unlink(zDb);
 }
+#endif
 
 int main(int argc, char **argv){
   const char *zExt = argc>1 ? argv[1] : "./columnar";
@@ -387,7 +391,9 @@ int main(int argc, char **argv){
   test_rollback(db);
   test_fuzz_names(db);
   close_db(db);
+#ifndef _WIN32
   test_crash_recovery(zExt);
+#endif
   printf("columnar robustness tests passed\n");
   return 0;
 }
