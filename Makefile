@@ -19,7 +19,7 @@ else
   UNAME_S := $(shell uname -s)
   PIC_FLAGS := -fPIC
   EXE_EXT :=
-  LDLIBS ?= -ldl -lpthread -lz
+  LDLIBS ?= -ldl -lpthread
 ifeq ($(UNAME_S),Darwin)
   SHLIB_EXT := dylib
   SHLIB_FLAGS := -dynamiclib -undefined dynamic_lookup

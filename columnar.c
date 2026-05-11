@@ -973,7 +973,7 @@ static int columnarUpdate(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv, s
   ColumnarVtab *p = (ColumnarVtab*)pVtab;
   ColumnarTableRef sRef = {p->zDb, p->zName};
   sqlite3_int64 oldRowid = 0;
-  sqlite3_int64 newRowid;
+  sqlite3_int64 newRowid = 0;
   int bExists = 0;
   int bInsert = 0;
   int bReplaceExisting = 0;

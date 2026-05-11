@@ -103,7 +103,17 @@ jobs:
     steps:
       - name: install Alpine dependencies
         if: matrix.container
-        run: apk add --no-cache build-base sqlite git
+        run: apk add --no-cache build-base sqlite git zlib-dev
+
+      - name: install Ubuntu dependencies
+        if: runner.os == 'Linux' && !matrix.container
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 zlib1g-dev
+
+      - name: install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install sqlite
+          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
 
       - uses: actions/checkout@v4.2.2
 
