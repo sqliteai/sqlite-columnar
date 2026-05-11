@@ -173,3 +173,24 @@ robustness suite checks rollback and savepoint behavior, simulated process
 death during an uncommitted transaction, unusual table/column names and mixed
 SQLite storage classes, and automatic result equivalence between each
 specialized columnar query helper and the matching ordinary SQLite query.
+
+## Part of the SQLite AI Ecosystem
+
+This project is part of the [**SQLite AI**](https://sqlite.ai) ecosystem, a collection of extensions that bring modern AI capabilities to the world’s most widely deployed database. The goal is to make SQLite the default data and inference engine for Edge AI applications.
+
+Other projects in the ecosystem include:
+
+| Extension | Description |
+|-----------|-------------|
+| **[SQLite-Sync](https://github.com/sqliteai/sqlite-sync)** | Local-first CRDT-based synchronization for seamless, conflict-free data sync and real-time collaboration across devices.
+| **[SQLite-AI](https://github.com/sqliteai/sqlite-ai)** | On-device inference and embedding generation |
+| **[SQLite-Memory](https://github.com/sqliteai/sqlite-memory)** | Markdown-based AI agent memory with semantic search |
+| **[SQLite-Vector](https://github.com/sqliteai/sqlite-vector)** | Vector search for embeddings stored as BLOBs |
+| **[SQLite-Agent](https://github.com/sqliteai/sqlite-agent)** | Run autonomous AI agents from within SQLite |
+| **[SQLite-MCP](https://github.com/sqliteai/sqlite-mcp)** | Connect SQLite databases to MCP servers |
+| **[SQLite-JS](https://github.com/sqliteai/sqlite-js)** | Custom SQLite functions in JavaScript |
+| **[Liteparser](https://github.com/sqliteai/liteparser)** | Fully compliant SQLite SQL parser |
+
+## License
+
+This project is licensed under the [Elastic License 2.0](./LICENSE.md). For production or managed service use, [contact SQLite Cloud, Inc](mailto:info@sqlitecloud.io) for a commercial license.
