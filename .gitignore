@@ -1,4 +1,6 @@
 .DS_Store
 build/
+dist/
 columnar.so
 columnar.dylib
+columnar.dll

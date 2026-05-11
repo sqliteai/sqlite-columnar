@@ -1,0 +1,299 @@
+name: build, test and release sqlite-columnar
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "*.*.*"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: sqlite-columnar-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }} build${{ matrix.test && ' + test' || '' }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container && matrix.container || '' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: columnar-linux-x86_64
+            output: columnar.so
+            test: true
+          - os: ubuntu-22.04-arm
+            artifact: columnar-linux-arm64
+            output: columnar.so
+            test: true
+          - os: ubuntu-22.04
+            container: alpine:latest
+            artifact: columnar-linux-musl-x86_64
+            output: columnar.so
+            test: true
+          - os: ubuntu-22.04-arm
+            container: alpine:latest
+            artifact: columnar-linux-musl-arm64
+            output: columnar.so
+            test: true
+          - os: macos-15
+            artifact: columnar-macos-universal
+            output: columnar.dylib
+            make_args: ARCH="x86_64 arm64"
+            notarize: true
+            test: true
+          - os: macos-15
+            artifact: columnar-macos-x86_64
+            output: columnar.dylib
+            make_args: ARCH=x86_64
+            notarize: true
+            test: false
+          - os: macos-15
+            artifact: columnar-macos-arm64
+            output: columnar.dylib
+            make_args: ARCH=arm64
+            notarize: true
+            test: true
+          - os: windows-2022
+            artifact: columnar-windows-x86_64
+            output: columnar.dll
+            test: true
+          - os: ubuntu-22.04
+            artifact: columnar-android-arm64-v8a
+            output: columnar.so
+            android_abi: aarch64-linux-android26
+            test: false
+          - os: ubuntu-22.04
+            artifact: columnar-android-armeabi-v7a
+            output: columnar.so
+            android_abi: armv7a-linux-androideabi26
+            test: false
+          - os: ubuntu-22.04
+            artifact: columnar-android-x86_64
+            output: columnar.so
+            android_abi: x86_64-linux-android26
+            test: false
+          - os: macos-15
+            artifact: columnar-ios-arm64
+            output: columnar.dylib
+            apple_sdk: iphoneos
+            apple_arch: arm64
+            apple_min: -miphoneos-version-min=11.0
+            test: false
+          - os: macos-15
+            artifact: columnar-ios-sim
+            output: columnar.dylib
+            apple_sdk: iphonesimulator
+            apple_arch: x86_64 arm64
+            apple_min: -miphonesimulator-version-min=11.0
+            test: false
+
+    defaults:
+      run:
+        shell: ${{ matrix.container && 'sh' || 'bash' }}
+
+    steps:
+      - name: install Alpine dependencies
+        if: matrix.container
+        run: apk add --no-cache build-base sqlite git
+
+      - uses: actions/checkout@v4.2.2
+
+      - name: setup MSYS2
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2.27.0
+        with:
+          msystem: mingw64
+          install: mingw-w64-x86_64-cc make mingw-w64-x86_64-sqlite3
+
+      - name: setup Android NDK
+        if: matrix.android_abi
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: build desktop extension
+        if: ${{ !matrix.android_abi && !matrix.apple_sdk && runner.os != 'Windows' }}
+        run: make extension ${{ matrix.make_args || '' }}
+
+      - name: build Windows extension
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: make extension
+
+      - name: build Android extension
+        if: matrix.android_abi
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          mkdir -p dist
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.android_abi }}-clang" \
+            -O2 -Wall -Wextra -Isqlite -fPIC -shared columnar.c -o dist/columnar.so
+
+      - name: build Apple mobile extension
+        if: matrix.apple_sdk
+        run: |
+          mkdir -p dist
+          SDK_PATH="$(xcrun --sdk "${{ matrix.apple_sdk }}" --show-sdk-path)"
+          ARCH_FLAGS=""
+          for arch in ${{ matrix.apple_arch }}; do
+            ARCH_FLAGS="$ARCH_FLAGS -arch $arch"
+          done
+          xcrun --sdk "${{ matrix.apple_sdk }}" clang \
+            -O2 -Wall -Wextra -Isqlite $ARCH_FLAGS \
+            -isysroot "$SDK_PATH" ${{ matrix.apple_min }} \
+            -dynamiclib columnar.c -o dist/columnar.dylib
+
+      - name: test extension
+        if: matrix.test && runner.os != 'Windows'
+        run: make test ${{ matrix.make_args || '' }}
+
+      - name: test Windows extension
+        if: matrix.test && runner.os == 'Windows'
+        shell: msys2 {0}
+        run: make test
+
+      - name: smoke load built artifact
+        if: matrix.test && runner.os != 'Windows'
+        run: 'sqlite3 :memory: ".load ./dist/columnar" "SELECT columnar_version();"'
+
+      - name: smoke load Windows artifact
+        if: matrix.test && runner.os == 'Windows'
+        shell: msys2 {0}
+        run: 'sqlite3 :memory: ".load ./dist/columnar" "SELECT columnar_version();"'
+
+      - name: validate macOS signing secrets
+        if: startsWith(github.ref, 'refs/tags/') && matrix.notarize
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in APPLE_CERTIFICATE CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD APPLE_TEAM_ID APPLE_ID APPLE_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is required to codesign and notarize macOS release artifacts"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: create keychain for macOS codesign
+        if: startsWith(github.ref, 'refs/tags/') && matrix.notarize
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer_id_application.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/columnar-signing.keychain-db"
+          /usr/bin/base64 -D <<< "$APPLE_CERTIFICATE" > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: codesign macOS dylib
+        if: startsWith(github.ref, 'refs/tags/') && matrix.notarize
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          codesign --force --sign "$APPLE_TEAM_ID" --timestamp --options runtime "dist/${{ matrix.output }}"
+          codesign --verify --strict --verbose=2 "dist/${{ matrix.output }}"
+
+      - name: stage artifact
+        run: |
+          mkdir -p package
+          cp "dist/${{ matrix.output }}" "package/${{ matrix.output }}"
+          cp README.md API.md BENCHMARK.md package/
+          printf "%s\n" "${{ github.sha }}" > package/GIT_COMMIT
+
+      - name: notarize macOS release archive
+        if: startsWith(github.ref, 'refs/tags/') && matrix.notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          RELEASE_DIR="release/${{ matrix.artifact }}-${VERSION}"
+          RELEASE_ZIP="release/${{ matrix.artifact }}-${VERSION}.zip"
+          mkdir -p "$RELEASE_DIR"
+          cp package/* "$RELEASE_DIR/"
+          ditto -c -k --keepParent "$RELEASE_DIR" "$RELEASE_ZIP"
+          xcrun notarytool submit "$RELEASE_ZIP" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+
+      - name: cleanup macOS signing keychain
+        if: always() && startsWith(github.ref, 'refs/tags/') && matrix.notarize
+        run: |
+          rm -f "$RUNNER_TEMP/developer_id_application.p12"
+          security delete-keychain "$RUNNER_TEMP/columnar-signing.keychain-db" || true
+
+      - uses: actions/upload-artifact@v4.6.2
+        if: startsWith(github.ref, 'refs/tags/') && matrix.notarize
+        with:
+          name: ${{ matrix.artifact }}
+          path: release/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4.6.2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') || !matrix.notarize }}
+        with:
+          name: ${{ matrix.artifact }}
+          path: package/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4.2.1
+        with:
+          path: artifacts
+
+      - name: package release archives
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p release
+          for dir in artifacts/columnar-*; do
+            name="$(basename "$dir")"
+            if compgen -G "$dir/*.zip" > /dev/null; then
+              cp "$dir"/*.zip release/
+            else
+              tar -C "$dir" -czf "release/${name}-${VERSION}.tar.gz" .
+            fi
+          done
+          (cd release && sha256sum * > SHA256SUMS)
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.zip
+            release/*.tar.gz
+            release/SHA256SUMS

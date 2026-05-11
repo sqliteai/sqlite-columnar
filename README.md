@@ -99,6 +99,15 @@ make SQLITE_SRC=/path/to/sqlite
 
 This produces `columnar.dylib` on macOS or `columnar.so` on Linux.
 
+## Prebuilt Binaries
+
+Tagged releases build loadable extension binaries for Linux, Linux musl,
+macOS, Windows, Android, iOS, and iOS Simulator. macOS release assets are
+Developer ID signed and notarized ZIP archives. Other platforms are published
+as release archives. Each asset contains the platform binary plus `README.md`,
+`API.md`, `BENCHMARK.md`, and `GIT_COMMIT`. Release assets also include
+`SHA256SUMS` for archive verification.
+
 ## Quick Start
 
 ```sql
