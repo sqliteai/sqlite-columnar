@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: "Optional tag/version to release after successful builds, for example 1.0.0. Leave empty for build-only."
+        description: "Optional release version, for example 1.0.0. Leave empty to use COLUMNAR_VERSION from columnar.c."
         required: false
         type: string
       prerelease:
@@ -127,6 +127,33 @@ jobs:
 
       - uses: actions/checkout@v4.2.2
 
+      - name: resolve release version
+        id: release
+        env:
+          INPUT_RELEASE_VERSION: ${{ github.event.inputs.release_version }}
+        run: |
+          set -eu
+          IS_RELEASE=false
+          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            IS_RELEASE=true
+            VERSION="$GITHUB_REF_NAME"
+          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            IS_RELEASE=true
+            if [ -n "$INPUT_RELEASE_VERSION" ]; then
+              VERSION="$INPUT_RELEASE_VERSION"
+            else
+              VERSION="$(sed -n 's/^# *define COLUMNAR_VERSION "\([^"]*\)".*/\1/p' columnar.c | head -n 1)"
+            fi
+          else
+            VERSION=""
+          fi
+          if [ "$IS_RELEASE" = "true" ] && [ -z "$VERSION" ]; then
+            echo "::error::Unable to resolve release version"
+            exit 1
+          fi
+          echo "is_release=$IS_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: setup MSYS2
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2.27.0
@@ -202,7 +229,7 @@ jobs:
         run: 'sqlite3 :memory: ".load ./dist/columnar" "SELECT columnar_version();"'
 
       - name: validate macOS signing secrets
-        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) && matrix.notarize
+        if: steps.release.outputs.is_release == 'true' && matrix.notarize
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
@@ -222,7 +249,7 @@ jobs:
           exit "$missing"
 
       - name: create keychain for macOS codesign
-        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) && matrix.notarize
+        if: steps.release.outputs.is_release == 'true' && matrix.notarize
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
@@ -241,7 +268,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
       - name: codesign macOS dylib
-        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) && matrix.notarize
+        if: steps.release.outputs.is_release == 'true' && matrix.notarize
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
@@ -257,18 +284,14 @@ jobs:
           printf "%s\n" "${{ github.sha }}" > package/GIT_COMMIT
 
       - name: notarize macOS release archive
-        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) && matrix.notarize
+        if: steps.release.outputs.is_release == 'true' && matrix.notarize
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
-            VERSION="$GITHUB_REF_NAME"
-          else
-            VERSION="${{ github.event.inputs.release_version }}"
-          fi
+          VERSION="${{ steps.release.outputs.version }}"
           RELEASE_DIR="release/${{ matrix.artifact }}-${VERSION}"
           RELEASE_ZIP="release/${{ matrix.artifact }}-${VERSION}.zip"
           mkdir -p "$RELEASE_DIR"
@@ -277,13 +300,13 @@ jobs:
           xcrun notarytool submit "$RELEASE_ZIP" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
 
       - name: cleanup macOS signing keychain
-        if: always() && (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) && matrix.notarize
+        if: always() && steps.release.outputs.is_release == 'true' && matrix.notarize
         run: |
           rm -f "$RUNNER_TEMP/developer_id_application.p12"
           security delete-keychain "$RUNNER_TEMP/columnar-signing.keychain-db" || true
 
       - uses: actions/upload-artifact@v4.6.2
-        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) && matrix.notarize
+        if: steps.release.outputs.is_release == 'true' && matrix.notarize
         with:
           name: ${{ matrix.artifact }}
           path: release/*.zip
@@ -291,7 +314,7 @@ jobs:
           retention-days: 14
 
       - uses: actions/upload-artifact@v4.6.2
-        if: ${{ !(startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')) || !matrix.notarize }}
+        if: ${{ steps.release.outputs.is_release != 'true' || !matrix.notarize }}
         with:
           name: ${{ matrix.artifact }}
           path: package/
@@ -299,20 +322,30 @@ jobs:
           retention-days: 14
 
   release:
-    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4.2.2
+
       - name: resolve release version
         id: release
+        env:
+          INPUT_RELEASE_VERSION: ${{ github.event.inputs.release_version }}
         run: |
           set -euo pipefail
           if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
             VERSION="$GITHUB_REF_NAME"
+          elif [ -n "$INPUT_RELEASE_VERSION" ]; then
+            VERSION="$INPUT_RELEASE_VERSION"
           else
-            VERSION="${{ github.event.inputs.release_version }}"
+            VERSION="$(sed -n 's/^# *define COLUMNAR_VERSION "\([^"]*\)".*/\1/p' columnar.c | head -n 1)"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::Unable to resolve release version"
+            exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -335,11 +368,48 @@ jobs:
           done
           (cd release && sha256sum * > SHA256SUMS)
 
+      - name: generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          GENERATED_NOTES="release/GENERATED_NOTES.md"
+          RELEASE_BODY="release/RELEASE_BODY.md"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$VERSION" \
+            -f target_commitish="$GITHUB_SHA" \
+            --jq .body > "$GENERATED_NOTES"
+          {
+            echo "## Builds"
+            echo
+            echo "All builds completed successfully for \`sqlite-columnar $VERSION\`. Download the archive matching your target platform:"
+            echo
+          } > "$RELEASE_BODY"
+          for file in release/*.zip release/*.tar.gz; do
+            [ -e "$file" ] || continue
+            printf -- "- \`%s\`\n" "$(basename "$file")"
+          done | sort >> "$RELEASE_BODY"
+          {
+            echo
+            echo "## Checksums"
+            echo
+            echo "Use \`SHA256SUMS\` to verify the downloaded archives."
+            echo
+            echo "## Release Notes"
+            echo
+          } >> "$RELEASE_BODY"
+          cat "$GENERATED_NOTES" >> "$RELEASE_BODY"
+
       - uses: softprops/action-gh-release@v2
         with:
+          name: sqlite-columnar ${{ steps.release.outputs.version }}
           tag_name: ${{ steps.release.outputs.version }}
           target_commitish: ${{ github.sha }}
-          generate_release_notes: true
+          body_path: release/RELEASE_BODY.md
+          draft: false
+          make_latest: true
+          overwrite_files: true
           prerelease: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prerelease == 'true' }}
           files: |
             release/*.zip
