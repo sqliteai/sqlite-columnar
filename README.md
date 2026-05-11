@@ -1,3 +1,41 @@
+<div align="center">
+  <a href="https://sqlite.ai">
+    <img src="https://www.sqlite.ai/social/logo-ai.png" alt="SQLite AI" height="56">
+  </a>
+
+  <h1>SQLite-Columnar</h1>
+  <p><strong>Column-oriented analytics inside SQLite.</strong><br>
+  Sub-second OLAP queries on local files — aggregations, scans, and time-series workloads at warehouse speed, without a warehouse.</p>
+
+  <p>
+    <a href="https://dashboard.sqlitecloud.io/auth/sign-in"><strong>Free managed instance →</strong></a> ·
+    <a href="https://docs.sqlitecloud.io/docs/ai-overview">Docs</a> ·
+    <a href="https://sqlite.ai">Website</a> ·
+    <a href="https://blog.sqlite.ai">Blog</a>
+  </p>
+
+  <p>
+    <sub><strong>Data:</strong>
+    <a href="https://github.com/sqliteai/sqlite-vector">Vector</a> ·
+    <a href="https://github.com/sqliteai/sqlite-sync">Sync</a> ·
+    <a href="https://github.com/sqliteai/sqlite-columnar">Columnar</a> ·
+    <a href="https://github.com/sqliteai/sqlite-js">JS</a>
+    <br>
+    <strong>AI:</strong>
+    <a href="https://github.com/sqliteai/sqlite-ai">AI</a> ·
+    <a href="https://github.com/sqliteai/sqlite-agent">Agent</a> ·
+    <a href="https://github.com/sqliteai/sqlite-memory">Memory</a> ·
+    <a href="https://github.com/sqliteai/sqlite-mcp">MCP</a>
+    </sub>
+  </p>
+</div>
+
+<br>
+
+> **Need analytics at cloud scale?** SQLite-Columnar runs OLAP locally; pair it with **[SQLite Cloud](https://dashboard.sqlitecloud.io/auth/sign-in)** to persist large datasets, run queries across regions, and share dashboards. Free tier available.
+
+---
+
 # sqlite-columnar
 
 `sqlite-columnar` brings column-oriented analytics to SQLite as a self-contained
@@ -174,23 +212,37 @@ death during an uncommitted transaction, unusual table/column names and mixed
 SQLite storage classes, and automatic result equivalence between each
 specialized columnar query helper and the matching ordinary SQLite query.
 
-## Part of the SQLite AI Ecosystem
-
-This project is part of the [**SQLite AI**](https://sqlite.ai) ecosystem, a collection of extensions that bring modern AI capabilities to the world’s most widely deployed database. The goal is to make SQLite the default data and inference engine for Edge AI applications.
-
-Other projects in the ecosystem include:
-
-| Extension | Description |
-|-----------|-------------|
-| **[SQLite-Sync](https://github.com/sqliteai/sqlite-sync)** | Local-first CRDT-based synchronization for seamless, conflict-free data sync and real-time collaboration across devices.
-| **[SQLite-AI](https://github.com/sqliteai/sqlite-ai)** | On-device inference and embedding generation |
-| **[SQLite-Memory](https://github.com/sqliteai/sqlite-memory)** | Markdown-based AI agent memory with semantic search |
-| **[SQLite-Vector](https://github.com/sqliteai/sqlite-vector)** | Vector search for embeddings stored as BLOBs |
-| **[SQLite-Agent](https://github.com/sqliteai/sqlite-agent)** | Run autonomous AI agents from within SQLite |
-| **[SQLite-MCP](https://github.com/sqliteai/sqlite-mcp)** | Connect SQLite databases to MCP servers |
-| **[SQLite-JS](https://github.com/sqliteai/sqlite-js)** | Custom SQLite functions in JavaScript |
-| **[Liteparser](https://github.com/sqliteai/liteparser)** | Fully compliant SQLite SQL parser |
-
 ## License
 
 This project is licensed under the [Elastic License 2.0](./LICENSE.md). For production or managed service use, [contact SQLite Cloud, Inc](mailto:info@sqlitecloud.io) for a commercial license.
+
+---
+
+## ☁️ Hosted version
+
+Don't want to run analytics infrastructure yourself? **[SQLite Cloud](https://sqlite.ai)** is the managed companion to SQLite-Columnar — local-first analytics with cloud persistence, multi-region replication, and shared dashboards.
+
+[**Start free →**](https://dashboard.sqlitecloud.io/auth/sign-in)
+
+---
+
+## Part of the SQLite AI stack
+
+SQLite-Columnar is one piece of a larger ecosystem that turns SQLite into a runtime for intelligent, distributed data:
+
+**Data layer**
+- [sqlite-vector](https://github.com/sqliteai/sqlite-vector) — ANN vector search inside SQLite
+- [sqlite-sync](https://github.com/sqliteai/sqlite-sync) — Offline-first CRDT sync across devices
+- [**sqlite-columnar**](https://github.com/sqliteai/sqlite-columnar) — Column-oriented analytics for OLAP queries *(you are here)*
+- [sqlite-js](https://github.com/sqliteai/sqlite-js) — Custom SQLite functions written in JavaScript
+
+**AI layer**
+- [sqlite-ai](https://github.com/sqliteai/sqlite-ai) — On-device LLM inference and embeddings
+- [sqlite-agent](https://github.com/sqliteai/sqlite-agent) — Autonomous AI agents running inside SQLite
+- [sqlite-memory](https://github.com/sqliteai/sqlite-memory) — Persistent, searchable memory for agents
+- [sqlite-mcp](https://github.com/sqliteai/sqlite-mcp) — Call MCP tools directly from SQL queries
+
+**Managed platform**
+- [SQLite Cloud](https://sqlite.ai) — Hosted SQLite with sync, auth, edge functions, and analytics. [Free tier →](https://dashboard.sqlitecloud.io/auth/sign-in)
+
+Built by [SQLite AI](https://sqlite.ai). Questions? [Contact us](https://sqlite.ai/support).
