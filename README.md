@@ -212,10 +212,6 @@ death during an uncommitted transaction, unusual table/column names and mixed
 SQLite storage classes, and automatic result equivalence between each
 specialized columnar query helper and the matching ordinary SQLite query.
 
-## License
-
-This project is licensed under the [Elastic License 2.0](./LICENSE.md). For production or managed service use, [contact SQLite Cloud, Inc](mailto:info@sqlitecloud.io) for a commercial license.
-
 ---
 
 ## ☁️ Hosted version
