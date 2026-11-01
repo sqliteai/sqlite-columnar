@@ -265,6 +265,54 @@ static void test_equivalence(sqlite3 *db){
   compare_standard_pair(db, "r", "c");
 }
 
+/* Authorizer used by test_destroy_error_path(): refuses to drop one shadow
+** table so that xDestroy reports a failure. */
+static int denyShadowDrop(void *pArg, int op, const char *a, const char *b,
+                          const char *c, const char *d){
+  (void)pArg; (void)b; (void)c; (void)d;
+  if( op==SQLITE_DROP_TABLE && a && strcmp(a, "destroyme__columnar_rowid")==0 ){
+    return SQLITE_DENY;
+  }
+  return SQLITE_OK;
+}
+
+/* SQLite only drops its reference to a virtual table when xDestroy succeeds;
+** on failure it disconnects the table itself, later. An xDestroy that frees
+** the table anyway leaves that reference dangling, and the rollback of the
+** failed DROP then reads and frees it a second time. */
+static void test_destroy_error_path(sqlite3 *db){
+  char *zLeft;
+  int rc;
+
+  execsql(db, "CREATE VIRTUAL TABLE destroyme USING columnar(a INTEGER)");
+  execsql(db, "INSERT INTO destroyme VALUES(1),(2)");
+  sqlite3_set_authorizer(db, denyShadowDrop, 0);
+  rc = sqlite3_exec(db, "DROP TABLE destroyme", 0, 0, 0);
+  sqlite3_set_authorizer(db, 0, 0);
+  if( rc==SQLITE_OK ){
+    fprintf(stderr, "expected the denied shadow DROP to fail xDestroy\n");
+    exit(1);
+  }
+  /* The DROP was rolled back, so the table must still be intact and usable. */
+  zLeft = query_result(db, "SELECT count(*) FROM destroyme");
+  if( zLeft==0 ) fatal(db, "oom", SQLITE_NOMEM);
+  if( strcmp(zLeft, "I:2")!=0 ){
+    fail_compare("table unusable after a failed DROP", zLeft, "I:2",
+                 "SELECT count(*) FROM destroyme", "");
+  }
+  sqlite3_free(zLeft);
+  zLeft = query_result(db, "SELECT count(*) FROM sqlite_master"
+                           " WHERE name LIKE 'destroyme%'");
+  if( zLeft==0 ) fatal(db, "oom", SQLITE_NOMEM);
+  /* vtab + rowid + 1 column + stat + chunk + dirty + meta = 7 */
+  if( strcmp(zLeft, "I:7")!=0 ){
+    fail_compare("shadow tables lost after a failed DROP", zLeft, "I:7",
+                 "SELECT count(*) FROM sqlite_master WHERE name LIKE 'destroyme%'", "");
+  }
+  sqlite3_free(zLeft);
+  execsql(db, "DROP TABLE destroyme");
+}
+
 static void test_rollback(sqlite3 *db){
   create_standard_pair(db, "rr", "cc");
   populate_standard_pair(db, "rr", "cc", 80);
@@ -320,6 +368,35 @@ static void test_api_fuzz(sqlite3 *db){
   expect_error(db, "missing value group", "SELECT * FROM columnar_group_sum('c','grp','missing_column')");
   expect_error(db, "missing filter range", "SELECT columnar_sum_where_range('c','v','missing_column',1,2)");
   expect_error(db, "wrong table type", "SELECT columnar_count(123,'v')");
+}
+
+/* columnar_analyze() creates the stats, chunk and dirty shadow tables on
+** demand.  A name that is not a columnar table must be rejected before any of
+** them is created, or the failed call leaves orphan tables in the schema. */
+static void test_analyze_no_garbage(sqlite3 *db){
+  static const char *const azName[] = { "plain_target", "absent_target" };
+  unsigned int i;
+
+  execsql(db, "CREATE TABLE plain_target(a,b)");
+  execsql(db, "INSERT INTO plain_target VALUES(1,2)");
+  for(i=0; i<sizeof(azName)/sizeof(azName[0]); i++){
+    char *zSql = sqlite3_mprintf("SELECT columnar_analyze(%Q)", azName[i]);
+    char *zLeft;
+    if( zSql==0 ) fatal(db, "oom", SQLITE_NOMEM);
+    expect_error(db, azName[i], zSql);
+    sqlite3_free(zSql);
+    zSql = sqlite3_mprintf("SELECT count(*) FROM sqlite_master"
+                           " WHERE name LIKE '%q__columnar%%'", azName[i]);
+    if( zSql==0 ) fatal(db, "oom", SQLITE_NOMEM);
+    zLeft = query_result(db, zSql);
+    if( zLeft==0 ) fatal(db, "oom", SQLITE_NOMEM);
+    if( strcmp(zLeft, "I:0")!=0 ){
+      fail_compare("analyze leaves shadow tables behind", zLeft, "I:0", zSql, "");
+    }
+    sqlite3_free(zLeft);
+    sqlite3_free(zSql);
+  }
+  execsql(db, "DROP TABLE plain_target");
 }
 
 #ifndef _WIN32
@@ -388,6 +465,8 @@ int main(int argc, char **argv){
   execsql(db, "PRAGMA trusted_schema=OFF");
   test_equivalence(db);
   test_api_fuzz(db);
+  test_analyze_no_garbage(db);
+  test_destroy_error_path(db);
   test_rollback(db);
   test_fuzz_names(db);
   close_db(db);

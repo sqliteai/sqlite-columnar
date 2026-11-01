@@ -32,6 +32,11 @@ Creates a column-oriented virtual table. Each declared column is stored in its
 own shadow table, with separate rowid, stats, chunk, dirty, and metadata shadow
 tables.
 
+Arguments are column definitions. A table constraint may be given and is
+accepted for compatibility, but it declares no column and is not enforced,
+since SQLite does not apply `CHECK`, `UNIQUE`, `PRIMARY KEY` or foreign key
+constraints to virtual tables. At least one column is required.
+
 ```sql
 CREATE VIRTUAL TABLE metrics USING columnar(
   ts INTEGER,
@@ -282,8 +287,26 @@ SELECT k, "sum", "avg", "count"
 ## Notes
 
 - `columnar_analyze()` creates and refreshes the stats and chunk metadata used
-  by the specialized helpers.
+  by the specialized helpers. It fails without writing anything if the name
+  does not refer to a columnar table. On a database written by version 1.0.0
+  the first call also rebuilds the chunk and stat tables once, so that analyzed
+  sums keep integer precision.
+- Columns carry the affinity of their declared type, so values are stored and
+  compared exactly as they would be in an ordinary table.
 - Group keys preserve SQLite storage classes for `NULL`, integer, real, text,
-  and blob values.
+  and blob values, including empty strings and zero-length blobs. When a key
+  appears as both an integer and a real, the two are one group and either value
+  may be reported as the key -- as with `GROUP BY`, which representative you
+  get depends on the query plan.
+- `columnar_sum()` and the grouped sums return an integer when every value
+  summed is an integer, matching `sum()`. They fall back to a floating point
+  result if the exact total would overflow, where `sum()` raises an error.
+- `columnar_group_min()`, `columnar_group_max()`, `columnar_group_min_max_count()`
+  and the `"min"`/`"max"` columns of `columnar_group_range()` compare values in
+  SQLite's own sort order and preserve their storage class, so text and blob
+  columns give the same answers as `min()` and `max()`.
+- Aggregates answered from `columnar_analyze()` metadata combine per-chunk
+  subtotals, so a floating point sum or average may differ from a full scan in
+  the last few digits.
 - Shadow tables named `<table>__columnar_*` are implementation details, not
   stable public API.

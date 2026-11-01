@@ -107,3 +107,143 @@ SELECT 'attached-group-range', k, round("sum",2)
   FROM columnar_group_sum_where_range('aux.ca','b','c','a',2,4)
  ORDER BY k;
 DETACH aux;
+
+-- Regression tests: each block below compares a columnar helper against the
+-- equivalent ordinary SQLite query.  Every 'ok' row must read ok.
+
+-- Declared column affinity is applied to stored values.
+CREATE VIRTUAL TABLE aff USING columnar(a INTEGER, b TEXT, c REAL, d);
+CREATE TABLE affref(a INTEGER, b TEXT, c REAL, d);
+INSERT INTO aff    VALUES('5','5','5','5'),(10,10,10,10),('7',7,'7',7);
+INSERT INTO affref VALUES('5','5','5','5'),(10,10,10,10),('7',7,'7',7);
+SELECT 'affinity-typeof', CASE WHEN (SELECT group_concat(typeof(a)||typeof(b)||typeof(c)||typeof(d))
+                                      FROM (SELECT * FROM aff ORDER BY rowid))
+                             = (SELECT group_concat(typeof(a)||typeof(b)||typeof(c)||typeof(d))
+                                      FROM (SELECT * FROM affref ORDER BY rowid))
+                        THEN 'ok' ELSE 'MISMATCH' END;
+SELECT 'affinity-order', CASE WHEN (SELECT group_concat(quote(a)) FROM (SELECT a FROM aff ORDER BY a))
+                                 = (SELECT group_concat(quote(a)) FROM (SELECT a FROM affref ORDER BY a))
+                            THEN 'ok' ELSE 'MISMATCH' END;
+SELECT 'affinity-maxmin', CASE WHEN quote((SELECT max(a) FROM aff))=quote((SELECT max(a) FROM affref))
+                                AND quote((SELECT min(a) FROM aff))=quote((SELECT min(a) FROM affref))
+                           THEN 'ok' ELSE 'MISMATCH' END;
+
+-- Range helpers apply the filter column's affinity to their bounds, both on
+-- the row scan and through the chunk zone map.
+CREATE VIRTUAL TABLE rng USING columnar(v REAL, f INTEGER);
+INSERT INTO rng VALUES(1.0,5),(2.0,15),(3.0,25);
+SELECT 'range-text-bounds-unanalyzed',
+       CASE WHEN columnar_count_where_range('rng','v','f','10','20')
+               = (SELECT count(v) FROM rng WHERE f BETWEEN '10' AND '20')
+       THEN 'ok' ELSE 'MISMATCH' END;
+SELECT 'range-analyze', columnar_analyze('rng');
+SELECT 'range-text-bounds-analyzed',
+       CASE WHEN columnar_count_where_range('rng','v','f','10','20')
+               = (SELECT count(v) FROM rng WHERE f BETWEEN '10' AND '20')
+        AND quote(columnar_sum_where_range('rng','v','f','10','20'))
+          = quote((SELECT sum(v) FROM rng WHERE f BETWEEN '10' AND '20'))
+       THEN 'ok' ELSE 'MISMATCH' END;
+
+-- Empty text and zero-length blob keys stay distinct from NULL.
+CREATE VIRTUAL TABLE gk USING columnar(k TEXT, v REAL);
+INSERT INTO gk VALUES('',1.0),('',2.0),(NULL,10.0),(x'',5.0),('a',100.0);
+SELECT 'group-empty-keys', typeof(k), quote(k), "sum"
+  FROM columnar_group_sum('gk','k','v') ORDER BY "sum";
+
+-- Integer sums keep full precision and integer storage class.
+CREATE VIRTUAL TABLE bigi USING columnar(n INTEGER, g TEXT);
+INSERT INTO bigi VALUES(9007199254740993,'a'),(1,'a'),(2,'a');
+SELECT 'sum-int-exact',
+       CASE WHEN quote(columnar_sum('bigi','n'))=quote((SELECT sum(n) FROM bigi))
+        AND (SELECT quote("sum") FROM columnar_group_sum('bigi','g','n'))
+          = (SELECT quote(sum(n)) FROM bigi GROUP BY g)
+       THEN 'ok' ELSE 'MISMATCH' END;
+SELECT 'sum-int-analyze', columnar_analyze('bigi');
+SELECT 'sum-int-exact-analyzed',
+       CASE WHEN quote(columnar_sum('bigi','n'))=quote((SELECT sum(n) FROM bigi))
+       THEN 'ok' ELSE 'MISMATCH' END;
+
+-- Grouped min/max follow SQLite's sort order and keep storage classes.
+CREATE VIRTUAL TABLE gm USING columnar(g TEXT, s TEXT, t TEXT);
+INSERT INTO gm VALUES('a','pear','x'),('a','apple','z'),('a','zebra','y');
+SELECT 'group-min-max-text',
+       CASE WHEN (SELECT quote("min")||'/'||quote("max")
+                    FROM columnar_group_min_max_count('gm','g','s'))
+               = (SELECT quote(min(s))||'/'||quote(max(s)) FROM gm GROUP BY g)
+        AND (SELECT quote("min") FROM columnar_group_min('gm','g','s'))
+          = (SELECT quote(min(s)) FROM gm GROUP BY g)
+        AND (SELECT quote("max") FROM columnar_group_max('gm','g','s'))
+          = (SELECT quote(max(s)) FROM gm GROUP BY g)
+       THEN 'ok' ELSE 'MISMATCH' END;
+SELECT 'group-range-text',
+       CASE WHEN (SELECT quote("max")||'/'||quote("min")
+                    FROM columnar_group_range('gm','g','s','t'))
+               = (SELECT quote(max(s))||'/'||quote(min(t)) FROM gm GROUP BY g)
+       THEN 'ok' ELSE 'MISMATCH' END;
+
+
+-- Table names are case-insensitive, so the helpers must accept any spelling.
+CREATE VIRTUAL TABLE MixedCase USING columnar(a INTEGER);
+INSERT INTO MixedCase VALUES(1),(2),(3);
+SELECT 'case-analyze-exact', columnar_analyze('MixedCase');
+SELECT 'case-analyze-upper', columnar_analyze('MIXEDCASE');
+SELECT 'case-analyze-lower', columnar_analyze('mixedcase');
+SELECT 'case-sum', CASE WHEN quote(columnar_sum('MIXEDCASE','a'))=quote((SELECT sum(a) FROM MixedCase))
+                   THEN 'ok' ELSE 'MISMATCH' END;
+
+-- A 1.0.0 database declares the chunk/stat sum columns REAL, which cannot hold
+-- an exact integer total.  Recreating that schema here stands in for such a
+-- database: the next analyze must replace it and recover full precision.
+CREATE VIRTUAL TABLE legacy USING columnar(n INTEGER);
+INSERT INTO legacy VALUES(9007199254740993),(1),(2);
+SELECT 'legacy-seed-analyze', columnar_analyze('legacy');
+DROP TABLE legacy__columnar_chunk;
+DROP TABLE legacy__columnar_stat;
+CREATE TABLE legacy__columnar_chunk(col INTEGER NOT NULL, chunk INTEGER NOT NULL,
+  rid_min INTEGER NOT NULL, rid_max INTEGER NOT NULL, row_count INTEGER NOT NULL,
+  nonnull_count INTEGER NOT NULL, sum REAL, min, max, PRIMARY KEY(col,chunk));
+CREATE TABLE legacy__columnar_stat(col INTEGER PRIMARY KEY, row_count INTEGER NOT NULL,
+  nonnull_count INTEGER NOT NULL, sum REAL, min, max);
+UPDATE legacy__columnar_meta SET v=0 WHERE k IN ('chunk_count','stats_valid');
+SELECT 'legacy-sum-decl-before', (SELECT type FROM pragma_table_info('legacy__columnar_chunk') WHERE name='sum');
+SELECT 'legacy-migrating-analyze', columnar_analyze('legacy');
+SELECT 'legacy-sum-decl-after', '['||(SELECT type FROM pragma_table_info('legacy__columnar_chunk') WHERE name='sum')||']';
+SELECT 'legacy-sum-exact', CASE WHEN quote(columnar_sum('legacy','n'))=quote((SELECT sum(n) FROM legacy))
+                           THEN 'ok' ELSE 'MISMATCH' END;
+SELECT 'legacy-analyze-idempotent', columnar_analyze('legacy');
+
+-- A table constraint among the module arguments declares no column. Counting
+-- it as one used to make the write path read past the end of xUpdate's
+-- argument vector. The shadow column count must match the declared count.
+CREATE VIRTUAL TABLE tc1 USING columnar(a INTEGER, CHECK(a>0));
+CREATE VIRTUAL TABLE tc2 USING columnar(a INTEGER, b TEXT, PRIMARY KEY(a));
+CREATE VIRTUAL TABLE tc3 USING columnar(a INTEGER, CONSTRAINT u UNIQUE(a));
+CREATE VIRTUAL TABLE tc4 USING columnar(a INTEGER, b TEXT, FOREIGN KEY(a) REFERENCES tc1(a));
+CREATE VIRTUAL TABLE tc5 USING columnar("check" INTEGER, [primary] TEXT);
+INSERT INTO tc1 VALUES(1);
+INSERT INTO tc2 VALUES(2,'b');
+INSERT INTO tc3 VALUES(3);
+INSERT INTO tc4 VALUES(4,'d');
+INSERT INTO tc5 VALUES(5,'e');
+SELECT 'constraint-arg-shadow-count', CASE WHEN
+      (SELECT count(*) FROM pragma_table_info('tc1'))
+    = (SELECT count(*) FROM sqlite_master WHERE name GLOB 'tc1__columnar_c[0-9]*')
+  AND (SELECT count(*) FROM pragma_table_info('tc2'))
+    = (SELECT count(*) FROM sqlite_master WHERE name GLOB 'tc2__columnar_c[0-9]*')
+  AND (SELECT count(*) FROM pragma_table_info('tc3'))
+    = (SELECT count(*) FROM sqlite_master WHERE name GLOB 'tc3__columnar_c[0-9]*')
+  AND (SELECT count(*) FROM pragma_table_info('tc4'))
+    = (SELECT count(*) FROM sqlite_master WHERE name GLOB 'tc4__columnar_c[0-9]*')
+  THEN 'ok' ELSE 'MISMATCH' END;
+SELECT 'constraint-arg-roundtrip', CASE WHEN
+      (SELECT a FROM tc1)=1 AND (SELECT a||b FROM tc2)='2b'
+  AND (SELECT a FROM tc3)=3 AND (SELECT a||b FROM tc4)='4d'
+  THEN 'ok' ELSE 'MISMATCH' END;
+-- A quoted keyword is a column name, not a constraint.
+SELECT 'quoted-keyword-is-column', CASE WHEN
+      (SELECT count(*) FROM pragma_table_info('tc5'))=2
+  AND (SELECT "check"||[primary] FROM tc5)='5e'
+  THEN 'ok' ELSE 'MISMATCH' END;
+-- A table of nothing but constraints declares no column and must be refused.
+SELECT 'no-columns-refused', CASE WHEN NOT EXISTS(
+    SELECT 1 FROM sqlite_master WHERE name='tc_bad') THEN 'ok' ELSE 'MISMATCH' END;

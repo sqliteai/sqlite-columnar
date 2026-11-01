@@ -34,7 +34,7 @@ SQLITE_EXTENSION_INIT1
 #endif
 
 #ifndef COLUMNAR_VERSION
-# define COLUMNAR_VERSION "1.0.0"
+# define COLUMNAR_VERSION "1.1.0"
 #endif
 
 #ifndef SQLITE_OMIT_VIRTUALTABLE
@@ -48,6 +48,9 @@ typedef struct ColumnarGroupVtab ColumnarGroupVtab;
 typedef struct ColumnarGroupCursor ColumnarGroupCursor;
 typedef struct ColumnarGroupEntry ColumnarGroupEntry;
 typedef struct ColumnarTableRef ColumnarTableRef;
+typedef struct ColumnarValue ColumnarValue;
+typedef struct ColumnarSum ColumnarSum;
+typedef struct ColumnarZoneBounds ColumnarZoneBounds;
 
 static sqlite3_module columnarModule;
 static sqlite3_module columnarGroupModule;
@@ -108,20 +111,53 @@ struct ColumnarGroupVtab {
   const ColumnarGroupAgg *pAgg;
 };
 
+/* A copy of an sqlite3_value, owned by whatever structure embeds it.
+**
+** eType is one of the SQLITE_NULL/INTEGER/FLOAT/TEXT/BLOB storage classes, or
+** zero when no value has been stored yet.  rNum carries the value as SQL
+** arithmetic sees it, so that numeric text behaves the way it would in an
+** ordinary expression.
+*/
+struct ColumnarValue {
+  int eType;
+  int nVal;                  /* Byte count, for TEXT and BLOB */
+  double rNum;
+  union {
+    sqlite3_int64 i;
+    double r;
+    void *p;                 /* TEXT and BLOB payload, sqlite3_malloc64'd */
+  } u;
+};
+
+/* A running sum that stays exact for as long as every value added is an
+** integer, the way SQLite's own sum() does.  It drops to floating point when a
+** non-integer value arrives or when the integer accumulator would overflow.
+*/
+struct ColumnarSum {
+  sqlite3_int64 nVal;        /* Number of non-NULL values summed */
+  sqlite3_int64 iSum;        /* Exact sum, valid while bInt */
+  double rSum;               /* Compensated sum; add rErr for the result */
+  double rErr;
+  int bInt;
+};
+
+/* Range bounds prepared for comparison against a chunk zone map. */
+struct ColumnarZoneBounds {
+  sqlite3_value *pLo;        /* Bound to bind; may alias the caller's value */
+  sqlite3_value *pHi;
+  sqlite3_value *pLoOwned;   /* Converted copies this struct must free */
+  sqlite3_value *pHiOwned;
+  int bUsable;               /* False when the zone map cannot be trusted */
+};
+
 struct ColumnarGroupEntry {
-  int eKeyType;
-  int nKey;
   unsigned int uKeyHash;
-  sqlite3_int64 iKey;
-  double rKey;
-  void *pKey;
-  sqlite3_int64 nCount;
-  double rSum;
-  double rMin;
-  double rMax;
   unsigned char bUsed;
-  unsigned char bMin;
-  unsigned char bMax;
+  ColumnarValue sKey;
+  ColumnarValue sMin;
+  ColumnarValue sMax;
+  ColumnarSum sSum;
+  sqlite3_int64 nCount;
 };
 
 struct ColumnarGroupCursor {
@@ -234,26 +270,197 @@ static int columnarIsIdentChar(char c){
   return ((c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9') || c=='_');
 }
 
-static char *columnarColumnName(sqlite3 *db, const char *zDef, int iCol){
-  const char *z = zDef;
-  char *zOut = 0;
-  if( z==0 || z[0]==0 ){
-    return sqlite3_mprintf("c%d", iCol);
-  }
-  while( z[0]==' ' || z[0]=='\t' || z[0]=='\n' || z[0]=='\r' ) z++;
+static int columnarIsSpace(char c){
+  return c==' ' || c=='\t' || c=='\n' || c=='\r' || c=='\f' || c=='\v';
+}
+
+/* Step past the column name at the start of a column definition. */
+static const char *columnarSkipColumnName(const char *z){
+  while( columnarIsSpace(z[0]) ) z++;
   if( z[0]=='"' || z[0]=='`' || z[0]=='[' ){
     char q = z[0]=='[' ? ']' : z[0];
-    const char *zStart = ++z;
-    while( z[0] && z[0]!=q ) z++;
-    zOut = sqlite3_mprintf("%.*s", (int)(z-zStart), zStart);
+    z++;
+    while( z[0] ){
+      if( z[0]==q ){
+        /* Inside "..." and `...` a doubled quote is an escaped quote. */
+        if( q!=']' && z[1]==q ){
+          z += 2;
+          continue;
+        }
+        z++;
+        break;
+      }
+      z++;
+    }
   }else{
-    const char *zStart = z;
     while( columnarIsIdentChar(z[0]) ) z++;
-    if( z>zStart ) zOut = sqlite3_mprintf("%.*s", (int)(z-zStart), zStart);
   }
-  if( zOut==0 ) zOut = sqlite3_mprintf("c%d", iCol);
-  (void)db;
-  return zOut;
+  return z;
+}
+
+/* True if the n-byte token at z starts a column constraint rather than
+** continuing the declared type. */
+static int columnarIsConstraintWord(const char *z, int n){
+  static const char *const azStop[] = {
+    "CONSTRAINT", "PRIMARY", "NOT", "NULL", "UNIQUE", "CHECK",
+    "DEFAULT", "COLLATE", "REFERENCES", "GENERATED", "AS"
+  };
+  int i;
+  for(i=0; i<(int)(sizeof(azStop)/sizeof(azStop[0])); i++){
+    if( (int)strlen(azStop[i])==n && sqlite3_strnicmp(z, azStop[i], n)==0 ){
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int columnarTypeContains(const char *z, int n, const char *zWord){
+  int nWord = (int)strlen(zWord);
+  int i;
+  for(i=0; i+nWord<=n; i++){
+    if( sqlite3_strnicmp(&z[i], zWord, nWord)==0 ) return 1;
+  }
+  return 0;
+}
+
+/* Isolate the declared type of a column definition: the token sequence between
+** the column name and the first column constraint.  Length is returned in
+** *pnType, which is zero when the column has no type at all. */
+static const char *columnarDeclaredType(const char *zDef, int *pnType){
+  const char *z = columnarSkipColumnName(zDef);
+  const char *zStart;
+  const char *zEnd;
+  int nDepth = 0;
+  while( columnarIsSpace(z[0]) ) z++;
+  zStart = z;
+  zEnd = z;
+  while( z[0] ){
+    if( z[0]=='(' ){
+      nDepth++;
+      z++;
+    }else if( z[0]==')' ){
+      if( nDepth>0 ) nDepth--;
+      z++;
+      zEnd = z;
+    }else if( nDepth>0 ){
+      z++;
+    }else if( columnarIsSpace(z[0]) ){
+      z++;
+    }else if( z[0]=='"' || z[0]=='`' || z[0]=='[' || z[0]=='\'' ){
+      /* A type name may be quoted, as in: c "DOUBLE PRECISION".  The quotes
+      ** are kept in the span, which is harmless for the keyword search. */
+      char q = z[0]=='[' ? ']' : z[0];
+      z++;
+      while( z[0] ){
+        if( z[0]==q ){
+          if( q!=']' && z[1]==q ){
+            z += 2;
+            continue;
+          }
+          z++;
+          break;
+        }
+        z++;
+      }
+      zEnd = z;
+    }else if( columnarIsIdentChar(z[0]) ){
+      const char *zTok = z;
+      while( columnarIsIdentChar(z[0]) ) z++;
+      if( columnarIsConstraintWord(zTok, (int)(z-zTok)) ) break;
+      zEnd = z;
+    }else{
+      break;
+    }
+  }
+  *pnType = (int)(zEnd - zStart);
+  return zStart;
+}
+
+/* The type keyword to declare a shadow column with, so that the shadow column
+** ends up with the same affinity SQLite would give the user's column.  Giving
+** the shadow column its real affinity is what makes stored values -- and the
+** comparisons the analytic helpers run directly against them -- behave exactly
+** as they would in an ordinary table.  Returns "" for a column with no type,
+** which leaves the shadow column with BLOB affinity, i.e. no conversion.
+**
+** The rules below are SQLite's own, applied in the same order.
+*/
+static const char *columnarAffinityType(const char *zDef){
+  const char *zType;
+  int nType = 0;
+  if( zDef==0 ) return "";
+  zType = columnarDeclaredType(zDef, &nType);
+  if( nType<=0 ) return "";
+  if( columnarTypeContains(zType, nType, "INT") ) return "INTEGER";
+  if( columnarTypeContains(zType, nType, "CHAR")
+   || columnarTypeContains(zType, nType, "CLOB")
+   || columnarTypeContains(zType, nType, "TEXT")
+  ){
+    return "TEXT";
+  }
+  if( columnarTypeContains(zType, nType, "BLOB") ) return "BLOB";
+  if( columnarTypeContains(zType, nType, "REAL")
+   || columnarTypeContains(zType, nType, "FLOA")
+   || columnarTypeContains(zType, nType, "DOUB")
+  ){
+    return "REAL";
+  }
+  return "NUMERIC";
+}
+
+/* True if a module argument is a table constraint rather than a column
+** definition.  SQLite's grammar makes this unambiguous: a table constraint
+** always opens with one of these keywords, and none of them is accepted as a
+** bare column name, so a quoted first token is always a column.
+**
+** The distinction matters because SQLite sizes xUpdate's argument vector from
+** the number of columns it declared.  Counting a constraint as a column would
+** make the write path read one element past the end of that vector.
+*/
+static int columnarIsTableConstraint(const char *zDef){
+  static const char *const azKw[] = {
+    "CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"
+  };
+  const char *z = zDef;
+  const char *zTok;
+  int n;
+  int i;
+
+  if( z==0 ) return 0;
+  while( columnarIsSpace(z[0]) ) z++;
+  if( z[0]=='"' || z[0]=='`' || z[0]=='[' || z[0]=='\'' ) return 0;
+  zTok = z;
+  while( columnarIsIdentChar(z[0]) ) z++;
+  n = (int)(z - zTok);
+  if( n==0 ) return 0;
+  for(i=0; i<(int)(sizeof(azKw)/sizeof(azKw[0])); i++){
+    if( (int)strlen(azKw[i])==n && sqlite3_strnicmp(zTok, azKw[i], n)==0 ){
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Number of module arguments that actually declare a column. */
+static int columnarCountColumns(int argc, const char *const *argv){
+  int n = 0;
+  int i;
+  for(i=3; i<argc; i++){
+    if( !columnarIsTableConstraint(argv[i]) ) n++;
+  }
+  return n;
+}
+
+/* The module argument declaring column iCol, or 0 if there is none. */
+static const char *columnarColumnArg(int argc, const char *const *argv, int iCol){
+  int n = 0;
+  int i;
+  for(i=3; i<argc; i++){
+    if( columnarIsTableConstraint(argv[i]) ) continue;
+    if( n==iCol ) return argv[i];
+    n++;
+  }
+  return 0;
 }
 
 static char *columnarDeclaration(sqlite3 *db, int argc, const char *const *argv){
@@ -302,7 +509,7 @@ static int columnarInit(sqlite3 *db, int bCreate, int argc, const char *const *a
   int rc;
   int i;
 
-  if( argc<4 ){
+  if( argc<4 || columnarCountColumns(argc, argv)<1 ){
     *pzErr = sqlite3_mprintf("columnar requires at least one column");
     return SQLITE_ERROR;
   }
@@ -317,7 +524,9 @@ static int columnarInit(sqlite3 *db, int bCreate, int argc, const char *const *a
   if( p==0 ) return SQLITE_NOMEM;
   memset(p, 0, sizeof(*p));
   p->db = db;
-  p->nCol = argc - 3;
+  /* Must match what sqlite3_declare_vtab() just declared: a table constraint
+  ** among the module arguments declares no column. */
+  p->nCol = columnarCountColumns(argc, argv);
   p->zDb = sqlite3_mprintf("%s", argv[1]);
   p->zName = sqlite3_mprintf("%s", argv[2]);
   p->zRowTab = sqlite3_mprintf("%s__columnar_rowid", argv[2]);
@@ -326,6 +535,9 @@ static int columnarInit(sqlite3 *db, int bCreate, int argc, const char *const *a
   p->zDirtyTab = sqlite3_mprintf("%s__columnar_dirty", argv[2]);
   p->zMetaTab = sqlite3_mprintf("%s__columnar_meta", argv[2]);
   p->azColTab = sqlite3_malloc64(sizeof(char*) * p->nCol);
+  /* Zero it before anything can fail: the cleanup below frees every element,
+  ** so an uninitialized array would have it free arbitrary values. */
+  if( p->azColTab ) memset(p->azColTab, 0, sizeof(char*) * p->nCol);
   if( p->zDb==0 || p->zName==0 || p->zRowTab==0
    || p->zStatTab==0 || p->zChunkTab==0 || p->zDirtyTab==0
    || p->zMetaTab==0
@@ -334,7 +546,6 @@ static int columnarInit(sqlite3 *db, int bCreate, int argc, const char *const *a
     columnarFreeVtab(p);
     return SQLITE_NOMEM;
   }
-  memset(p->azColTab, 0, sizeof(char*) * p->nCol);
   for(i=0; i<p->nCol; i++){
     p->azColTab[i] = sqlite3_mprintf("%s__columnar_c%d", argv[2], i);
     if( p->azColTab[i]==0 ){
@@ -356,7 +567,7 @@ static int columnarInit(sqlite3 *db, int bCreate, int argc, const char *const *a
       columnarFreeVtab(p);
       return rc;
     }
-    zSql = sqlite3_mprintf("CREATE TABLE %Q.%Q(" "col INTEGER PRIMARY KEY," "row_count INTEGER NOT NULL," "nonnull_count INTEGER NOT NULL," "sum REAL," "min," "max" ")", p->zDb, p->zStatTab);
+    zSql = sqlite3_mprintf("CREATE TABLE %Q.%Q(" "col INTEGER PRIMARY KEY," "row_count INTEGER NOT NULL," "nonnull_count INTEGER NOT NULL," "sum," "min," "max" ")", p->zDb, p->zStatTab);
     if( zSql==0 ){
       columnarFreeVtab(p);
       return SQLITE_NOMEM;
@@ -367,7 +578,7 @@ static int columnarInit(sqlite3 *db, int bCreate, int argc, const char *const *a
       columnarFreeVtab(p);
       return rc;
     }
-    zSql = sqlite3_mprintf("CREATE TABLE %Q.%Q(" "col INTEGER NOT NULL," "chunk INTEGER NOT NULL," "rid_min INTEGER NOT NULL," "rid_max INTEGER NOT NULL," "row_count INTEGER NOT NULL," "nonnull_count INTEGER NOT NULL," "sum REAL," "min," "max," "PRIMARY KEY(col,chunk)" ")", p->zDb, p->zChunkTab);
+    zSql = sqlite3_mprintf("CREATE TABLE %Q.%Q(" "col INTEGER NOT NULL," "chunk INTEGER NOT NULL," "rid_min INTEGER NOT NULL," "rid_max INTEGER NOT NULL," "row_count INTEGER NOT NULL," "nonnull_count INTEGER NOT NULL," "sum," "min," "max," "PRIMARY KEY(col,chunk)" ")", p->zDb, p->zChunkTab);
     if( zSql==0 ){
       columnarFreeVtab(p);
       return SQLITE_NOMEM;
@@ -412,13 +623,7 @@ static int columnarInit(sqlite3 *db, int bCreate, int argc, const char *const *a
       return rc;
     }
     for(i=0; i<p->nCol; i++){
-      char *zCol = columnarColumnName(db, argv[3+i], i);
-      if( zCol==0 ){
-        columnarFreeVtab(p);
-        return SQLITE_NOMEM;
-      }
-      zSql = sqlite3_mprintf("CREATE TABLE %Q.%Q(rid INTEGER PRIMARY KEY, v)", p->zDb, p->azColTab[i]);
-      sqlite3_free(zCol);
+      zSql = sqlite3_mprintf("CREATE TABLE %Q.%Q(rid INTEGER PRIMARY KEY, v %s)", p->zDb, p->azColTab[i], columnarAffinityType(columnarColumnArg(argc, argv, i)));
       if( zSql==0 ){
         columnarFreeVtab(p);
         return SQLITE_NOMEM;
@@ -451,6 +656,8 @@ static int columnarDisconnect(sqlite3_vtab *pVtab){
   return SQLITE_OK;
 }
 
+static int columnarTableExists(sqlite3 *db, const char *zDb, const char *zTab, int *pbExists);
+
 static int columnarDestroy(sqlite3_vtab *pVtab){
   ColumnarVtab *p = (ColumnarVtab*)pVtab;
   sqlite3 *db = p->db;
@@ -465,6 +672,29 @@ static int columnarDestroy(sqlite3_vtab *pVtab){
       rc = columnarExec(db, &zErr, zSql);
       sqlite3_free(zSql);
     }
+  }
+  /* Releases up to 1.0.0 counted table constraints as columns and so created
+  ** one shadow column table too many.  Drop any that are still there, or they
+  ** would be left behind and block recreating a table of this name. */
+  for(i=p->nCol; rc==SQLITE_OK; i++){
+    char *zTab = sqlite3_mprintf("%s__columnar_c%d", p->zName, i);
+    int bExists = 0;
+    if( zTab==0 ){
+      rc = SQLITE_NOMEM;
+      break;
+    }
+    rc = columnarTableExists(db, p->zDb, zTab, &bExists);
+    if( rc==SQLITE_OK && bExists ){
+      char *zSql = sqlite3_mprintf("DROP TABLE IF EXISTS %Q.%Q", p->zDb, zTab);
+      if( zSql==0 ){
+        rc = SQLITE_NOMEM;
+      }else{
+        rc = columnarExec(db, &zErr, zSql);
+        sqlite3_free(zSql);
+      }
+    }
+    sqlite3_free(zTab);
+    if( !bExists ) break;
   }
   if( rc==SQLITE_OK ){
     char *zSql = sqlite3_mprintf("DROP TABLE IF EXISTS %Q.%Q", p->zDb, p->zStatTab);
@@ -512,13 +742,16 @@ static int columnarDestroy(sqlite3_vtab *pVtab){
     }
   }
   if( rc!=SQLITE_OK ){
+    /* SQLite only clears its pointer to this vtab when xDestroy succeeds, and
+    ** disconnects it later itself.  Freeing it here would leave that pointer
+    ** dangling, to be used and freed a second time during the rollback. */
     sqlite3_free(p->base.zErrMsg);
     p->base.zErrMsg = zErr;
-  }else{
-    sqlite3_free(zErr);
+    return rc;
   }
+  sqlite3_free(zErr);
   columnarDisconnect(pVtab);
-  return rc;
+  return SQLITE_OK;
 }
 
 static int columnarOpen(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor){
@@ -761,6 +994,395 @@ static int columnarStepDone(sqlite3_stmt *pStmt){
   return rc==SQLITE_DONE ? SQLITE_OK : rc;
 }
 
+// PRAGMA MARK: - Stored Values -
+
+#define COLUMNAR_MAX_I64  ((sqlite3_int64)0x7fffffffffffffffLL)
+#define COLUMNAR_MIN_I64  (-COLUMNAR_MAX_I64 - 1)
+
+static int columnarDoubleToInt64(double r, sqlite3_int64 *pi);
+
+/* Take a private copy of pVal.  Either succeeds or leaves *p untouched. */
+static int columnarValueSave(ColumnarValue *p, sqlite3_value *pVal){
+  int eType = sqlite3_value_type(pVal);
+  const void *aData = 0;
+  int nData = 0;
+
+  if( eType==SQLITE_TEXT ){
+    aData = (const void*)sqlite3_value_text(pVal);
+    nData = sqlite3_value_bytes(pVal);
+  }else if( eType!=SQLITE_NULL && eType!=SQLITE_INTEGER && eType!=SQLITE_FLOAT ){
+    eType = SQLITE_BLOB;
+    aData = sqlite3_value_blob(pVal);
+    nData = sqlite3_value_bytes(pVal);
+  }
+  if( eType==SQLITE_TEXT || eType==SQLITE_BLOB ){
+    void *pNew = 0;
+    if( nData>0 ){
+      if( aData==0 ) return SQLITE_NOMEM;
+      pNew = sqlite3_malloc64((sqlite3_uint64)nData);
+      if( pNew==0 ) return SQLITE_NOMEM;
+      memcpy(pNew, aData, (size_t)nData);
+    }
+    p->u.p = pNew;
+    p->nVal = nData;
+  }else if( eType==SQLITE_INTEGER ){
+    p->u.i = sqlite3_value_int64(pVal);
+    p->nVal = 0;
+  }else{
+    p->u.r = sqlite3_value_double(pVal);
+    p->nVal = 0;
+  }
+  p->eType = eType;
+  p->rNum = eType==SQLITE_NULL ? 0.0 : sqlite3_value_double(pVal);
+  return SQLITE_OK;
+}
+
+static void columnarValueClear(ColumnarValue *p){
+  if( p->eType==SQLITE_TEXT || p->eType==SQLITE_BLOB ){
+    sqlite3_free(p->u.p);
+  }
+  p->u.p = 0;
+  p->nVal = 0;
+  p->eType = 0;
+}
+
+static void columnarValueResult(sqlite3_context *ctx, const ColumnarValue *p){
+  switch( p->eType ){
+    case SQLITE_INTEGER:
+      sqlite3_result_int64(ctx, p->u.i);
+      break;
+    case SQLITE_FLOAT:
+      sqlite3_result_double(ctx, p->u.r);
+      break;
+    case SQLITE_TEXT:
+      /* A null pointer would make this a NULL result rather than an empty
+      ** string, so hand sqlite3_result_text() something valid for nVal==0. */
+      sqlite3_result_text(ctx, p->nVal ? (const char*)p->u.p : "", p->nVal, SQLITE_TRANSIENT);
+      break;
+    case SQLITE_BLOB:
+      sqlite3_result_blob(ctx, p->nVal ? p->u.p : "", p->nVal, SQLITE_TRANSIENT);
+      break;
+    default:
+      sqlite3_result_null(ctx);
+      break;
+  }
+}
+
+/* Sort class, following SQLite's NULL < numeric < text < blob ordering. */
+static int columnarValueClass(int eType){
+  switch( eType ){
+    case SQLITE_NULL:     return 0;
+    case SQLITE_INTEGER:
+    case SQLITE_FLOAT:    return 1;
+    case SQLITE_TEXT:     return 2;
+    default:              return 3;
+  }
+}
+
+/* Compare a stored value against pVal in SQLite's BINARY sort order, returning
+** a negative, zero or positive result as *p sorts before, with, or after
+** pVal. */
+static int columnarValueCompare(const ColumnarValue *p, sqlite3_value *pVal){
+  int eType = sqlite3_value_type(pVal);
+  int cA = columnarValueClass(p->eType);
+  int cB = columnarValueClass(eType);
+
+  if( cA!=cB ) return cA<cB ? -1 : 1;
+  if( cA==0 ) return 0;
+  if( cA==1 ){
+    if( p->eType==SQLITE_INTEGER && eType==SQLITE_INTEGER ){
+      sqlite3_int64 a = p->u.i;
+      sqlite3_int64 b = sqlite3_value_int64(pVal);
+      return a<b ? -1 : (a>b ? 1 : 0);
+    }else{
+      double a = p->eType==SQLITE_INTEGER ? (double)p->u.i : p->u.r;
+      double b = sqlite3_value_double(pVal);
+      return a<b ? -1 : (a>b ? 1 : 0);
+    }
+  }
+  {
+    const void *aB;
+    int nB;
+    int n;
+    int c;
+    if( cA==2 ){
+      aB = (const void*)sqlite3_value_text(pVal);
+    }else{
+      aB = sqlite3_value_blob(pVal);
+    }
+    nB = sqlite3_value_bytes(pVal);
+    if( aB==0 ) nB = 0;
+    n = p->nVal<nB ? p->nVal : nB;
+    c = n>0 ? memcmp(p->u.p, aB, (size_t)n) : 0;
+    if( c!=0 ) return c<0 ? -1 : 1;
+    return p->nVal<nB ? -1 : (p->nVal>nB ? 1 : 0);
+  }
+}
+
+/* Grouping-key equality.  Unlike columnarValueCompare() this treats an integer
+** and a float holding the same value as one key, matching what GROUP BY does.
+*/
+static int columnarValueEqual(const ColumnarValue *p, sqlite3_value *pVal){
+  int eType = sqlite3_value_type(pVal);
+  if( p->eType==SQLITE_NULL || eType==SQLITE_NULL ){
+    return p->eType==SQLITE_NULL && eType==SQLITE_NULL;
+  }
+  if( p->eType==SQLITE_INTEGER && eType==SQLITE_INTEGER ){
+    return p->u.i==sqlite3_value_int64(pVal);
+  }
+  if( p->eType==SQLITE_INTEGER && eType==SQLITE_FLOAT ){
+    sqlite3_int64 iVal;
+    return columnarDoubleToInt64(sqlite3_value_double(pVal), &iVal)
+        && p->u.i==iVal;
+  }
+  if( p->eType==SQLITE_FLOAT && eType==SQLITE_INTEGER ){
+    sqlite3_int64 iVal;
+    return columnarDoubleToInt64(p->u.r, &iVal)
+        && iVal==sqlite3_value_int64(pVal);
+  }
+  if( p->eType==SQLITE_FLOAT && eType==SQLITE_FLOAT ){
+    return p->u.r==sqlite3_value_double(pVal);
+  }
+  if( p->eType!=eType ) return 0;
+  return columnarValueCompare(p, pVal)==0;
+}
+
+// PRAGMA MARK: - Running Sums -
+
+static void columnarSumInit(ColumnarSum *p){
+  p->nVal = 0;
+  p->iSum = 0;
+  p->rSum = 0.0;
+  p->rErr = 0.0;
+  p->bInt = 1;
+}
+
+static double columnarFabs(double r){
+  return r<0.0 ? -r : r;
+}
+
+/* One Kahan-Babuska-Neumaier step, the compensated summation SQLite's own
+** sum() and avg() use.  Without it the floating point result drifts from
+** theirs in the last digits. */
+static void columnarSumStep(ColumnarSum *p, double r){
+  double s = p->rSum;
+  double t = s + r;
+  if( columnarFabs(s) > columnarFabs(r) ){
+    p->rErr += (s - t) + r;
+  }else{
+    p->rErr += (r - t) + s;
+  }
+  p->rSum = t;
+}
+
+/* Fold in a sum of nVal integer values. */
+static void columnarSumAddInt(ColumnarSum *p, sqlite3_int64 iVal, sqlite3_int64 nVal){
+  p->nVal += nVal;
+  /* Large magnitudes are split so the compensated sum keeps every bit, the
+  ** way SQLite splits them. */
+  if( iVal<=-4503599627370496LL || iVal>=4503599627370496LL ){
+    sqlite3_int64 iSml = iVal % 16384;
+    columnarSumStep(p, (double)(iVal - iSml));
+    columnarSumStep(p, (double)iSml);
+  }else{
+    columnarSumStep(p, (double)iVal);
+  }
+  if( p->bInt ){
+    if( (iVal>0 && p->iSum>COLUMNAR_MAX_I64-iVal)
+     || (iVal<0 && p->iSum<COLUMNAR_MIN_I64-iVal)
+    ){
+      /* The exact sum no longer fits; fall back to the compensated double
+      ** rather than failing the query the way sum() would. */
+      p->bInt = 0;
+    }else{
+      p->iSum += iVal;
+    }
+  }
+}
+
+/* Fold in a sum of nVal values that is not exactly an integer. */
+static void columnarSumAddDouble(ColumnarSum *p, double rVal, sqlite3_int64 nVal){
+  p->nVal += nVal;
+  columnarSumStep(p, rVal);
+  p->bInt = 0;
+}
+
+static void columnarSumAddValue(ColumnarSum *p, sqlite3_value *pVal){
+  switch( sqlite3_value_type(pVal) ){
+    case SQLITE_NULL:
+      break;
+    case SQLITE_INTEGER:
+      columnarSumAddInt(p, sqlite3_value_int64(pVal), 1);
+      break;
+    case SQLITE_FLOAT:
+      columnarSumAddDouble(p, sqlite3_value_double(pVal), 1);
+      break;
+    default: {
+      /* sum() applies numeric affinity before accumulating, so text holding a
+      ** plain integer keeps the exact accumulator alive just as it does in
+      ** SQL.  sqlite3_value_dup() hands back a protected copy, which is what
+      ** makes it safe to convert one taken from a statement column. */
+      sqlite3_value *pNum = sqlite3_value_dup(pVal);
+      if( pNum==0 ){
+        columnarSumAddDouble(p, sqlite3_value_double(pVal), 1);
+      }else{
+        if( sqlite3_value_numeric_type(pNum)==SQLITE_INTEGER ){
+          columnarSumAddInt(p, sqlite3_value_int64(pNum), 1);
+        }else{
+          columnarSumAddDouble(p, sqlite3_value_double(pNum), 1);
+        }
+        sqlite3_value_free(pNum);
+      }
+      break;
+    }
+  }
+}
+
+static void columnarSumAddColumn(ColumnarSum *p, sqlite3_stmt *pStmt, int iCol){
+  columnarSumAddValue(p, sqlite3_column_value(pStmt, iCol));
+}
+
+/* The compensated total.  A NaN correction term is dropped, as SQLite does. */
+static double columnarSumDouble(const ColumnarSum *p){
+  double r = p->rSum;
+  if( p->rErr==p->rErr ) r += p->rErr;
+  return r;
+}
+
+static void columnarSumResult(sqlite3_context *ctx, const ColumnarSum *p){
+  if( p->nVal==0 ){
+    sqlite3_result_null(ctx);
+  }else if( p->bInt ){
+    sqlite3_result_int64(ctx, p->iSum);
+  }else{
+    sqlite3_result_double(ctx, columnarSumDouble(p));
+  }
+}
+
+static void columnarAvgResult(sqlite3_context *ctx, const ColumnarSum *p){
+  if( p->nVal==0 ){
+    sqlite3_result_null(ctx);
+  }else if( p->bInt ){
+    sqlite3_result_double(ctx, (double)p->iSum/(double)p->nVal);
+  }else{
+    sqlite3_result_double(ctx, columnarSumDouble(p)/(double)p->nVal);
+  }
+}
+
+// PRAGMA MARK: - Column Affinity -
+
+#define COLUMNAR_AFF_NONE  0       /* BLOB affinity: compare values as stored */
+#define COLUMNAR_AFF_TEXT  1
+#define COLUMNAR_AFF_NUM   2       /* INTEGER, REAL or NUMERIC */
+
+/* Comparison affinity of a declared type, by SQLite's rules. */
+static int columnarAffinityOfType(const char *zType){
+  int n = zType ? (int)strlen(zType) : 0;
+  if( n==0 ) return COLUMNAR_AFF_NONE;
+  if( columnarTypeContains(zType, n, "INT") ) return COLUMNAR_AFF_NUM;
+  if( columnarTypeContains(zType, n, "CHAR")
+   || columnarTypeContains(zType, n, "CLOB")
+   || columnarTypeContains(zType, n, "TEXT")
+  ){
+    return COLUMNAR_AFF_TEXT;
+  }
+  if( columnarTypeContains(zType, n, "BLOB") ) return COLUMNAR_AFF_NONE;
+  if( columnarTypeContains(zType, n, "REAL")
+   || columnarTypeContains(zType, n, "FLOA")
+   || columnarTypeContains(zType, n, "DOUB")
+  ){
+    return COLUMNAR_AFF_NUM;
+  }
+  return COLUMNAR_AFF_NUM;         /* NUMERIC */
+}
+
+/* Read a columnar column's affinity back out of its shadow table schema.
+** Databases written before shadow columns carried an affinity report no type,
+** which yields COLUMNAR_AFF_NONE -- the right answer for their untyped data.
+*/
+static int columnarColumnAffinity(sqlite3 *db, const ColumnarTableRef *pRef, int iCol, int *peAff){
+  sqlite3_stmt *pStmt = 0;
+  char *zSql;
+  int rc;
+
+  *peAff = COLUMNAR_AFF_NONE;
+  zSql = sqlite3_mprintf("PRAGMA \"%w\".table_info(\"%w__columnar_c%d\")", pRef->zDb, pRef->zTab, iCol);
+  if( zSql==0 ) return SQLITE_NOMEM;
+  rc = sqlite3_prepare_v2(db, zSql, -1, &pStmt, 0);
+  sqlite3_free(zSql);
+  if( rc!=SQLITE_OK ) return rc;
+  while( (rc = sqlite3_step(pStmt))==SQLITE_ROW ){
+    const char *zName = (const char*)sqlite3_column_text(pStmt, 1);
+    if( zName && sqlite3_stricmp(zName, "v")==0 ){
+      *peAff = columnarAffinityOfType((const char*)sqlite3_column_text(pStmt, 2));
+      break;
+    }
+  }
+  if( rc==SQLITE_ROW || rc==SQLITE_DONE ) rc = SQLITE_OK;
+  sqlite3_finalize(pStmt);
+  return rc;
+}
+
+/* Convert one bound for comparison against the zone map's typeless min/max
+** columns.  Returns 0 when the conversion cannot be expressed, which tells the
+** caller to skip the zone map and scan instead. */
+static int columnarZoneBound(int eAff, sqlite3_value *pVal, sqlite3_value **ppOut, sqlite3_value **ppOwned, int *pRc){
+  int eType = sqlite3_value_type(pVal);
+  *ppOut = pVal;
+  *ppOwned = 0;
+  if( eAff==COLUMNAR_AFF_NONE || eType==SQLITE_NULL ) return 1;
+  if( eAff==COLUMNAR_AFF_NUM ){
+    sqlite3_value *pNew;
+    if( eType!=SQLITE_TEXT && eType!=SQLITE_BLOB ) return 1;
+    pNew = sqlite3_value_dup(pVal);
+    if( pNew==0 ){
+      *pRc = SQLITE_NOMEM;
+      return 0;
+    }
+    /* Exactly the numeric affinity a comparison against this column applies. */
+    sqlite3_value_numeric_type(pNew);
+    *ppOut = pNew;
+    *ppOwned = pNew;
+    return 1;
+  }
+  /* TEXT affinity would stringify a numeric bound; rather than reimplement
+  ** that here, fall back to the scan, whose comparison does it for us. */
+  return eType!=SQLITE_INTEGER && eType!=SQLITE_FLOAT;
+}
+
+static void columnarZoneBoundsClear(ColumnarZoneBounds *pZone){
+  sqlite3_value_free(pZone->pLoOwned);
+  sqlite3_value_free(pZone->pHiOwned);
+  pZone->pLoOwned = 0;
+  pZone->pHiOwned = 0;
+}
+
+/* Prepare lo/hi for the chunk zone map.  The zone map's min/max columns are
+** typeless but hold values that already carry the data column's affinity, so
+** the bounds need the same conversion the scan comparison would give them.
+** Without it an integer column queried with text bounds prunes every chunk. */
+static int columnarZoneBoundsInit(sqlite3 *db, const ColumnarTableRef *pRef, int iFilterCol, sqlite3_value *pLo, sqlite3_value *pHi, ColumnarZoneBounds *pZone){
+  int eAff = COLUMNAR_AFF_NONE;
+  int rc = SQLITE_OK;
+
+  memset(pZone, 0, sizeof(*pZone));
+  pZone->pLo = pLo;
+  pZone->pHi = pHi;
+  pZone->bUsable = 1;
+  rc = columnarColumnAffinity(db, pRef, iFilterCol, &eAff);
+  if( rc!=SQLITE_OK ) return rc;
+  if( !columnarZoneBound(eAff, pLo, &pZone->pLo, &pZone->pLoOwned, &rc)
+   || !columnarZoneBound(eAff, pHi, &pZone->pHi, &pZone->pHiOwned, &rc)
+  ){
+    pZone->bUsable = 0;
+  }
+  if( rc!=SQLITE_OK ){
+    columnarZoneBoundsClear(pZone);
+    return rc;
+  }
+  return SQLITE_OK;
+}
+
 // PRAGMA MARK: - Metadata -
 
 static int columnarEnsureMetaTable(sqlite3 *db, const ColumnarTableRef *pRef, char **pzErr){
@@ -770,6 +1392,47 @@ static int columnarEnsureMetaTable(sqlite3 *db, const ColumnarTableRef *pRef, ch
   rc = columnarExec(db, pzErr, zSql);
   sqlite3_free(zSql);
   return rc;
+}
+
+/* True if zTab names an existing table in schema zDb.  The comparison is
+** NOCASE because table names are, so that columnar_analyze('MYTAB') still
+** finds the shadow tables of a table created as MyTab. */
+static int columnarTableExists(sqlite3 *db, const char *zDb, const char *zTab, int *pbExists){
+  sqlite3_stmt *pStmt = 0;
+  int rc = columnarPrepare(db, &pStmt, 0, "SELECT 1 FROM \"%w\".sqlite_master WHERE type='table' AND name=?1 COLLATE NOCASE", zDb);
+  *pbExists = 0;
+  if( rc!=SQLITE_OK ) return rc;
+  sqlite3_bind_text(pStmt, 1, zTab, -1, SQLITE_STATIC);
+  rc = sqlite3_step(pStmt);
+  if( rc==SQLITE_ROW ){
+    *pbExists = 1;
+    rc = SQLITE_OK;
+  }else if( rc==SQLITE_DONE ){
+    rc = SQLITE_OK;
+  }
+  sqlite3_finalize(pStmt);
+  return rc;
+}
+
+/* Confirm pRef really is a columnar table.  columnar_analyze() creates missing
+** shadow tables on demand, so without this check an unrelated -- or simply
+** misspelled -- table name would leave a set of orphan shadow tables behind in
+** the schema before the first real error was reported. */
+static int columnarRequireColumnarTable(sqlite3 *db, const ColumnarTableRef *pRef, char **pzErr){
+  char *zRowTab = sqlite3_mprintf("%s__columnar_rowid", pRef->zTab);
+  int bExists = 0;
+  int rc;
+  if( zRowTab==0 ) return SQLITE_NOMEM;
+  rc = columnarTableExists(db, pRef->zDb, zRowTab, &bExists);
+  sqlite3_free(zRowTab);
+  if( rc!=SQLITE_OK ) return rc;
+  if( !bExists ){
+    if( pzErr ){
+      *pzErr = sqlite3_mprintf("no such columnar table: %s", pRef->zTab);
+    }
+    return SQLITE_ERROR;
+  }
+  return SQLITE_OK;
 }
 
 static int columnarMetaGetInt(sqlite3 *db, const ColumnarTableRef *pRef, const char *zKey, sqlite3_int64 *pVal, int *pbFound){
@@ -941,6 +1604,10 @@ static int columnarRowidExists(ColumnarVtab *p, sqlite3_int64 iRowid, int *pbExi
 
 static int columnarInsertRow(ColumnarVtab *p, sqlite3_int64 iRowid, int argc, sqlite3_value **argv){
   sqlite3_stmt *pStmt = 0;
+  /* xUpdate passes two leading values plus one per declared column.  p->nCol
+  ** should equal argc-2, but clamp rather than trust it: reading past argv[]
+  ** would hand sqlite3_bind_value() a wild pointer. */
+  int nCol = argc-2 < p->nCol ? argc-2 : p->nCol;
   int rc;
   int i;
   const char *zConflict = "";
@@ -956,7 +1623,7 @@ static int columnarInsertRow(ColumnarVtab *p, sqlite3_int64 iRowid, int argc, sq
     rc = columnarStepDone(pStmt);
   }
   sqlite3_finalize(pStmt);
-  for(i=0; rc==SQLITE_OK && i<p->nCol; i++){
+  for(i=0; rc==SQLITE_OK && i<nCol; i++){
     rc = columnarPrepare(p->db, &pStmt, 0, "INSERT %sINTO %Q.%Q(rid,v) VALUES(?1,?2)", zConflict, p->zDb, p->azColTab[i]);
     if( rc==SQLITE_OK ){
       sqlite3_bind_int64(pStmt, 1, iRowid);
@@ -965,7 +1632,6 @@ static int columnarInsertRow(ColumnarVtab *p, sqlite3_int64 iRowid, int argc, sq
     }
     sqlite3_finalize(pStmt);
   }
-  (void)argc;
   return rc;
 }
 
@@ -1299,10 +1965,10 @@ static void columnarAnalyticFunc(sqlite3_context *ctx, int argc, sqlite3_value *
   int iCol = -1;
   int aCol[1];
   int rc;
-  sqlite3_int64 n = 0;
-  double rSum = 0.0;
+  ColumnarSum sAcc;
   int bDone = 0;
 
+  columnarSumInit(&sAcc);
   rc = columnarParseTableColumnsArgs(ctx, argc, argv, &sRef, eOp!=COLUMNAR_ANALYTIC_COUNT || argc>1, 0, aCol);
   if( rc!=SQLITE_OK ) return;
   if( eOp!=COLUMNAR_ANALYTIC_COUNT || argc>1 ) iCol = aCol[0];
@@ -1333,12 +1999,13 @@ static void columnarAnalyticFunc(sqlite3_context *ctx, int argc, sqlite3_value *
 
   while( (rc = sqlite3_step(pStmt))==SQLITE_ROW ){
     if( eOp==COLUMNAR_ANALYTIC_COUNT && iCol<0 ){
-      n++;
+      sAcc.nVal++;
     }else if( sqlite3_column_type(pStmt, 0)!=SQLITE_NULL ){
       if( eOp!=COLUMNAR_ANALYTIC_COUNT ){
-        rSum += sqlite3_column_double(pStmt, 0);
+        columnarSumAddColumn(&sAcc, pStmt, 0);
+      }else{
+        sAcc.nVal++;
       }
-      n++;
     }
   }
   if( rc!=SQLITE_DONE ){
@@ -1352,16 +2019,14 @@ static void columnarAnalyticFunc(sqlite3_context *ctx, int argc, sqlite3_value *
 
   switch( eOp ){
     case COLUMNAR_ANALYTIC_SUM:
-      if( n==0 ) sqlite3_result_null(ctx);
-      else sqlite3_result_double(ctx, rSum);
+      columnarSumResult(ctx, &sAcc);
       break;
     case COLUMNAR_ANALYTIC_AVG:
-      if( n==0 ) sqlite3_result_null(ctx);
-      else sqlite3_result_double(ctx, rSum/(double)n);
+      columnarAvgResult(ctx, &sAcc);
       break;
     default:
       assert( eOp==COLUMNAR_ANALYTIC_COUNT );
-      sqlite3_result_int64(ctx, n);
+      sqlite3_result_int64(ctx, sAcc.nVal);
       break;
   }
 }
@@ -1392,11 +2057,84 @@ static int columnarInt64Query(sqlite3 *db, sqlite3_int64 *pVal, const char *zFmt
 // PRAGMA MARK: - Analyze -
 
 static int columnarEnsureChunkTable(sqlite3 *db, const ColumnarTableRef *pRef, char **pzErr){
-  char *zSql = sqlite3_mprintf("CREATE TABLE IF NOT EXISTS \"%w\".\"%w__columnar_chunk\"(" "col INTEGER NOT NULL," "chunk INTEGER NOT NULL," "rid_min INTEGER NOT NULL," "rid_max INTEGER NOT NULL," "row_count INTEGER NOT NULL," "nonnull_count INTEGER NOT NULL," "sum REAL," "min," "max," "PRIMARY KEY(col,chunk)" ")", pRef->zDb, pRef->zTab);
+  char *zSql = sqlite3_mprintf("CREATE TABLE IF NOT EXISTS \"%w\".\"%w__columnar_chunk\"(" "col INTEGER NOT NULL," "chunk INTEGER NOT NULL," "rid_min INTEGER NOT NULL," "rid_max INTEGER NOT NULL," "row_count INTEGER NOT NULL," "nonnull_count INTEGER NOT NULL," "sum," "min," "max," "PRIMARY KEY(col,chunk)" ")", pRef->zDb, pRef->zTab);
   int rc;
   if( zSql==0 ) return SQLITE_NOMEM;
   rc = columnarExec(db, pzErr, zSql);
   sqlite3_free(zSql);
+  return rc;
+}
+
+static int columnarEnsureStatTable(sqlite3 *db, const ColumnarTableRef *pRef, char **pzErr){
+  char *zSql = sqlite3_mprintf("CREATE TABLE IF NOT EXISTS \"%w\".\"%w__columnar_stat\"(" "col INTEGER PRIMARY KEY," "row_count INTEGER NOT NULL," "nonnull_count INTEGER NOT NULL," "sum," "min," "max" ")", pRef->zDb, pRef->zTab);
+  int rc;
+  if( zSql==0 ) return SQLITE_NOMEM;
+  rc = columnarExec(db, pzErr, zSql);
+  sqlite3_free(zSql);
+  return rc;
+}
+
+/* Release 1.0.0 declared the chunk and stat "sum" columns REAL, which forced
+** every subtotal to floating point and lost precision on large integer sums.
+** They are now typeless.  Detect the old declaration so it can be replaced. */
+static int columnarHasLegacySumColumn(sqlite3 *db, const ColumnarTableRef *pRef, int *pbLegacy){
+  sqlite3_stmt *pStmt = 0;
+  char *zSql;
+  int rc;
+
+  *pbLegacy = 0;
+  zSql = sqlite3_mprintf("PRAGMA \"%w\".table_info(\"%w__columnar_chunk\")", pRef->zDb, pRef->zTab);
+  if( zSql==0 ) return SQLITE_NOMEM;
+  rc = sqlite3_prepare_v2(db, zSql, -1, &pStmt, 0);
+  sqlite3_free(zSql);
+  if( rc!=SQLITE_OK ) return rc;
+  while( (rc = sqlite3_step(pStmt))==SQLITE_ROW ){
+    const char *zName = (const char*)sqlite3_column_text(pStmt, 1);
+    if( zName && sqlite3_stricmp(zName, "sum")==0 ){
+      const char *zType = (const char*)sqlite3_column_text(pStmt, 2);
+      *pbLegacy = zType!=0 && zType[0]!=0;
+      break;
+    }
+  }
+  if( rc==SQLITE_ROW || rc==SQLITE_DONE ) rc = SQLITE_OK;
+  sqlite3_finalize(pStmt);
+  return rc;
+}
+
+/* Replace the legacy chunk and stat tables with ones whose sum column can hold
+** an exact integer.  Both hold nothing but data derived from the column
+** tables, so dropping them is safe: clearing the chunk count sends the caller
+** down its rebuild-everything path and the stats come back correct. */
+static int columnarMigrateSumColumns(sqlite3 *db, const ColumnarTableRef *pRef, char **pzErr){
+  char *zSql;
+  int rc;
+
+  /* The first drop doubles as a probe: if the schema cannot be changed here,
+  ** leave the old tables in place and keep the previous behaviour rather than
+  ** failing the call.  Their sums stay floating point, which is what this
+  ** database has always returned. */
+  zSql = sqlite3_mprintf("DROP TABLE IF EXISTS \"%w\".\"%w__columnar_chunk\"", pRef->zDb, pRef->zTab);
+  if( zSql==0 ) return SQLITE_NOMEM;
+  rc = columnarExec(db, 0, zSql);
+  sqlite3_free(zSql);
+  if( rc!=SQLITE_OK ) return SQLITE_OK;
+
+  /* Past this point the chunk table is gone, so errors must be reported. */
+  zSql = sqlite3_mprintf("DROP TABLE IF EXISTS \"%w\".\"%w__columnar_stat\"", pRef->zDb, pRef->zTab);
+  if( zSql==0 ) return SQLITE_NOMEM;
+  rc = columnarExec(db, pzErr, zSql);
+  sqlite3_free(zSql);
+  if( rc==SQLITE_OK ) rc = columnarEnsureChunkTable(db, pRef, pzErr);
+  if( rc==SQLITE_OK ) rc = columnarEnsureStatTable(db, pRef, pzErr);
+  if( rc==SQLITE_OK ){
+    zSql = sqlite3_mprintf("DELETE FROM \"%w\".\"%w__columnar_dirty\"", pRef->zDb, pRef->zTab);
+    if( zSql==0 ) return SQLITE_NOMEM;
+    rc = columnarExec(db, pzErr, zSql);
+    sqlite3_free(zSql);
+  }
+  if( rc==SQLITE_OK ) rc = columnarMetaSetInt(db, pRef, "chunk_count", 0);
+  if( rc==SQLITE_OK ) rc = columnarMetaSetInt(db, pRef, "dirty_count", 0);
+  if( rc==SQLITE_OK ) rc = columnarMetaSetInt(db, pRef, "stats_valid", 0);
   return rc;
 }
 
@@ -1434,6 +2172,8 @@ static void columnarAnalyzeFunc(sqlite3_context *ctx, int argc, sqlite3_value **
     return;
   }
 
+  rc = columnarRequireColumnarTable(db, &sRef, &zErr);
+  if( rc!=SQLITE_OK ) goto analyze_error;
   rc = columnarEnsureMetaTable(db, &sRef, &zErr);
   if( rc!=SQLITE_OK ) goto analyze_error;
   rc = columnarMetaGetInt(db, &sRef, "ncol", &nStatsValid, &bFound);
@@ -1450,6 +2190,17 @@ static void columnarAnalyzeFunc(sqlite3_context *ctx, int argc, sqlite3_value **
   if( rc!=SQLITE_OK ) goto analyze_error;
   rc = columnarEnsureDirtyTable(db, &sRef, &zErr);
   if( rc!=SQLITE_OK ) goto analyze_error;
+  rc = columnarEnsureStatTable(db, &sRef, &zErr);
+  if( rc!=SQLITE_OK ) goto analyze_error;
+  {
+    int bLegacy = 0;
+    rc = columnarHasLegacySumColumn(db, &sRef, &bLegacy);
+    if( rc!=SQLITE_OK ) goto analyze_error;
+    if( bLegacy ){
+      rc = columnarMigrateSumColumns(db, &sRef, &zErr);
+      if( rc!=SQLITE_OK ) goto analyze_error;
+    }
+  }
 
   rc = columnarMetaGetInt(db, &sRef, "dirty_count", &nDirtyTotal, &bFound);
   if( rc!=SQLITE_OK ) goto analyze_error;
@@ -1675,7 +2426,7 @@ static int columnarRangeOpenScan(sqlite3 *db, sqlite3_stmt **ppScan, const Colum
   }
 }
 
-static int columnarRangeRunScan(sqlite3_stmt *pScan, int bChunked, sqlite3_int64 iRidMin, sqlite3_int64 iRidMax, sqlite3_value *pLo, sqlite3_value *pHi, int eOp, sqlite3_int64 *pn, double *prSum){
+static int columnarRangeRunScan(sqlite3_stmt *pScan, int bChunked, sqlite3_int64 iRidMin, sqlite3_int64 iRidMax, sqlite3_value *pLo, sqlite3_value *pHi, int eOp, ColumnarSum *pAcc){
   int rc;
   sqlite3_reset(pScan);
   sqlite3_clear_bindings(pScan);
@@ -1691,33 +2442,44 @@ static int columnarRangeRunScan(sqlite3_stmt *pScan, int bChunked, sqlite3_int64
   while( (rc = sqlite3_step(pScan))==SQLITE_ROW ){
     if( sqlite3_column_type(pScan, 0)!=SQLITE_NULL ){
       if( eOp!=COLUMNAR_ANALYTIC_COUNT ){
-        *prSum += sqlite3_column_double(pScan, 0);
+        columnarSumAddColumn(pAcc, pScan, 0);
+      }else{
+        pAcc->nVal++;
       }
-      (*pn)++;
     }
   }
   return rc==SQLITE_DONE ? SQLITE_OK : rc;
 }
 
-static void columnarRangeUseChunkStats(int eOp, sqlite3_int64 nChunk, double rChunkSum, int bChunkSum, sqlite3_int64 *pn, double *prSum){
+/* Fold a whole chunk's precomputed stats in, for a chunk that the zone map
+** says passes the filter in its entirety.  iCount and iSum are the result
+** columns of pChunk holding the value column's nonnull_count and sum. */
+static void columnarRangeUseChunkStats(int eOp, sqlite3_stmt *pChunk, int iCount, int iSum, ColumnarSum *pAcc){
+  sqlite3_int64 nChunk = sqlite3_column_int64(pChunk, iCount);
   if( nChunk<=0 ) return;
-  if( eOp!=COLUMNAR_ANALYTIC_COUNT && !bChunkSum ) return;
-  *pn += nChunk;
-  if( eOp!=COLUMNAR_ANALYTIC_COUNT ){
-    *prSum += rChunkSum;
+  if( eOp==COLUMNAR_ANALYTIC_COUNT ){
+    pAcc->nVal += nChunk;
+    return;
+  }
+  if( sqlite3_column_type(pChunk, iSum)==SQLITE_NULL ) return;
+  if( sqlite3_column_type(pChunk, iSum)==SQLITE_INTEGER ){
+    columnarSumAddInt(pAcc, sqlite3_column_int64(pChunk, iSum), nChunk);
+  }else{
+    columnarSumAddDouble(pAcc, sqlite3_column_double(pChunk, iSum), nChunk);
   }
 }
 
-static int columnarRangeCompute(sqlite3 *db, const ColumnarTableRef *pRef, int iValCol, int iFilterCol, sqlite3_value *pLo, sqlite3_value *pHi, int eOp, sqlite3_int64 *pn, double *prSum){
+static int columnarRangeCompute(sqlite3 *db, const ColumnarTableRef *pRef, int iValCol, int iFilterCol, sqlite3_value *pLo, sqlite3_value *pHi, int eOp, ColumnarSum *pAcc){
   sqlite3_stmt *pChunk = 0;
   sqlite3_stmt *pScan = 0;
   sqlite3_int64 nChunk = 0;
   sqlite3_int64 nDirtyFilter = 0;
   sqlite3_int64 nDirtyValue = 0;
+  ColumnarZoneBounds sZone;
   int rc;
 
-  *pn = 0;
-  *prSum = 0.0;
+  memset(&sZone, 0, sizeof(sZone));
+  columnarSumInit(pAcc);
   rc = columnarDirtyCountForColumn(db, pRef, iFilterCol, &nDirtyFilter);
   if( rc!=SQLITE_OK ) return rc;
   rc = columnarDirtyCountForColumn(db, pRef, iValCol, &nDirtyValue);
@@ -1725,26 +2487,34 @@ static int columnarRangeCompute(sqlite3 *db, const ColumnarTableRef *pRef, int i
   if( nDirtyFilter>0 || nDirtyValue>0 ){
     rc = columnarRangeOpenScan(db, &pScan, pRef, iValCol, iFilterCol, 0);
     if( rc==SQLITE_OK ){
-      rc = columnarRangeRunScan(pScan, 0, 0, 0, pLo, pHi, eOp, pn, prSum);
+      rc = columnarRangeRunScan(pScan, 0, 0, 0, pLo, pHi, eOp, pAcc);
     }
     sqlite3_finalize(pScan);
     return rc;
   }
   rc = columnarChunkCountForColumn(db, pRef, iFilterCol, &nChunk);
-  if( rc!=SQLITE_OK || nChunk==0 ){
+  if( rc==SQLITE_OK && nChunk>0 ){
+    rc = columnarZoneBoundsInit(db, pRef, iFilterCol, pLo, pHi, &sZone);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+  if( rc!=SQLITE_OK || nChunk==0 || !sZone.bUsable ){
+    columnarZoneBoundsClear(&sZone);
     rc = columnarRangeOpenScan(db, &pScan, pRef, iValCol, iFilterCol, 0);
     if( rc==SQLITE_OK ){
-      rc = columnarRangeRunScan(pScan, 0, 0, 0, pLo, pHi, eOp, pn, prSum);
+      rc = columnarRangeRunScan(pScan, 0, 0, 0, pLo, pHi, eOp, pAcc);
     }
     sqlite3_finalize(pScan);
     return rc;
   }
 
   rc = columnarPrepare(db, &pChunk, 0, "SELECT f.rid_min,f.rid_max," " (f.nonnull_count=f.row_count AND f.min>=?2 AND f.max<=?3)," " v.nonnull_count,v.sum" " FROM \"%w\".\"%w__columnar_chunk\" AS f" " JOIN \"%w\".\"%w__columnar_chunk\" AS v" "   ON v.col=?4 AND v.chunk=f.chunk" " WHERE f.col=?1 AND f.min IS NOT NULL AND f.max>=?2 AND f.min<=?3" " ORDER BY f.chunk", pRef->zDb, pRef->zTab, pRef->zDb, pRef->zTab);
-  if( rc!=SQLITE_OK ) return rc;
+  if( rc!=SQLITE_OK ){
+    columnarZoneBoundsClear(&sZone);
+    return rc;
+  }
   sqlite3_bind_int(pChunk, 1, iFilterCol);
-  sqlite3_bind_value(pChunk, 2, pLo);
-  sqlite3_bind_value(pChunk, 3, pHi);
+  sqlite3_bind_value(pChunk, 2, sZone.pLo);
+  sqlite3_bind_value(pChunk, 3, sZone.pHi);
   sqlite3_bind_int(pChunk, 4, iValCol);
 
   rc = columnarRangeOpenScan(db, &pScan, pRef, iValCol, iFilterCol, 1);
@@ -1752,15 +2522,16 @@ static int columnarRangeCompute(sqlite3 *db, const ColumnarTableRef *pRef, int i
 
   while( (rc = sqlite3_step(pChunk))==SQLITE_ROW ){
     if( sqlite3_column_int(pChunk, 2) ){
-      columnarRangeUseChunkStats(eOp, sqlite3_column_int64(pChunk, 3), sqlite3_column_double(pChunk, 4), sqlite3_column_type(pChunk, 4)!=SQLITE_NULL, pn, prSum);
+      columnarRangeUseChunkStats(eOp, pChunk, 3, 4, pAcc);
     }else{
-      rc = columnarRangeRunScan(pScan, 1, sqlite3_column_int64(pChunk, 0), sqlite3_column_int64(pChunk, 1), pLo, pHi, eOp, pn, prSum);
+      rc = columnarRangeRunScan(pScan, 1, sqlite3_column_int64(pChunk, 0), sqlite3_column_int64(pChunk, 1), pLo, pHi, eOp, pAcc);
       if( rc!=SQLITE_OK ) goto range_compute_done;
     }
   }
   if( rc==SQLITE_DONE ) rc = SQLITE_OK;
 
 range_compute_done:
+  columnarZoneBoundsClear(&sZone);
   sqlite3_finalize(pChunk);
   sqlite3_finalize(pScan);
   return rc;
@@ -1775,13 +2546,13 @@ static void columnarRangeAnalyticFunc(sqlite3_context *ctx, int argc, sqlite3_va
   sqlite3_value *pHi = 0;
   int iValCol = -1;
   int iFilterCol = -1;
-  sqlite3_int64 n = 0;
-  double rSum = 0.0;
+  ColumnarSum sAcc;
   int rc;
 
+  columnarSumInit(&sAcc);
   rc = columnarRangeArgs(ctx, argc, argv, &sRef, &iValCol, &iFilterCol, &pLo, &pHi);
   if( rc!=SQLITE_OK ) return;
-  rc = columnarRangeCompute(db, &sRef, iValCol, iFilterCol, pLo, pHi, pAnalytic->eOp, &n, &rSum);
+  rc = columnarRangeCompute(db, &sRef, iValCol, iFilterCol, pLo, pHi, pAnalytic->eOp, &sAcc);
   if( rc!=SQLITE_OK ){
     sqlite3_result_error(ctx, sqlite3_errmsg(db), -1);
     columnarClearTableRef(&sRef);
@@ -1790,16 +2561,14 @@ static void columnarRangeAnalyticFunc(sqlite3_context *ctx, int argc, sqlite3_va
   columnarClearTableRef(&sRef);
   switch( pAnalytic->eOp ){
     case COLUMNAR_ANALYTIC_SUM:
-      if( n==0 ) sqlite3_result_null(ctx);
-      else sqlite3_result_double(ctx, rSum);
+      columnarSumResult(ctx, &sAcc);
       break;
     case COLUMNAR_ANALYTIC_AVG:
-      if( n==0 ) sqlite3_result_null(ctx);
-      else sqlite3_result_double(ctx, rSum/(double)n);
+      columnarAvgResult(ctx, &sAcc);
       break;
     default:
       assert( pAnalytic->eOp==COLUMNAR_ANALYTIC_COUNT );
-      sqlite3_result_int64(ctx, n);
+      sqlite3_result_int64(ctx, sAcc.nVal);
       break;
   }
 }
@@ -1852,104 +2621,21 @@ static unsigned int columnarGroupKeyHash(sqlite3_value *pKey){
     }
     case SQLITE_TEXT: {
       const unsigned char *z = sqlite3_value_text(pKey);
-      int n = sqlite3_value_bytes(pKey);
-      if( z==0 && n>0 ) return 0;
+      int n = z ? sqlite3_value_bytes(pKey) : 0;
       return columnarHashBytes(z, n, 0x811c9dc5u ^ 0x54u);
     }
     default: {
       const unsigned char *a = sqlite3_value_blob(pKey);
-      int n = sqlite3_value_bytes(pKey);
-      if( a==0 && n>0 ) return 0;
+      int n = a ? sqlite3_value_bytes(pKey) : 0;
       return columnarHashBytes(a, n, 0x811c9dc5u ^ 0x42u);
     }
   }
 }
 
-static int columnarGroupKeyEqual(const ColumnarGroupEntry *pEntry, sqlite3_value *pKey){
-  int eType = sqlite3_value_type(pKey);
-  if( pEntry->eKeyType==SQLITE_NULL || eType==SQLITE_NULL ){
-    return pEntry->eKeyType==SQLITE_NULL && eType==SQLITE_NULL;
-  }
-  if( pEntry->eKeyType==SQLITE_INTEGER && eType==SQLITE_INTEGER ){
-    return pEntry->iKey==sqlite3_value_int64(pKey);
-  }
-  if( pEntry->eKeyType==SQLITE_INTEGER && eType==SQLITE_FLOAT ){
-    sqlite3_int64 iKey;
-    return columnarDoubleToInt64(sqlite3_value_double(pKey), &iKey)
-        && pEntry->iKey==iKey;
-  }
-  if( pEntry->eKeyType==SQLITE_FLOAT && eType==SQLITE_INTEGER ){
-    sqlite3_int64 iKey;
-    return columnarDoubleToInt64(pEntry->rKey, &iKey)
-        && iKey==sqlite3_value_int64(pKey);
-  }
-  if( pEntry->eKeyType==SQLITE_FLOAT && eType==SQLITE_FLOAT ){
-    return pEntry->rKey==sqlite3_value_double(pKey);
-  }
-  if( pEntry->eKeyType==SQLITE_TEXT && eType==SQLITE_TEXT ){
-    int n = sqlite3_value_bytes(pKey);
-    const unsigned char *z = sqlite3_value_text(pKey);
-    if( z==0 && n>0 ) return 0;
-    return pEntry->nKey==n
-        && (n==0 || memcmp(pEntry->pKey, z, (size_t)n)==0);
-  }
-  if( pEntry->eKeyType==SQLITE_BLOB && eType==SQLITE_BLOB ){
-    int n = sqlite3_value_bytes(pKey);
-    const void *a = sqlite3_value_blob(pKey);
-    if( a==0 && n>0 ) return 0;
-    return pEntry->nKey==n
-        && (n==0 || memcmp(pEntry->pKey, a, (size_t)n)==0);
-  }
-  return 0;
-}
-
-static int columnarGroupKeySave(ColumnarGroupEntry *pEntry, sqlite3_value *pKey){
-  int eType = sqlite3_value_type(pKey);
-  pEntry->eKeyType = eType;
-  switch( eType ){
-    case SQLITE_NULL:
-      break;
-    case SQLITE_INTEGER:
-      pEntry->iKey = sqlite3_value_int64(pKey);
-      break;
-    case SQLITE_FLOAT:
-      pEntry->rKey = sqlite3_value_double(pKey);
-      break;
-    case SQLITE_TEXT: {
-      const unsigned char *z = sqlite3_value_text(pKey);
-      int n = sqlite3_value_bytes(pKey);
-      if( z==0 && n>0 ) return SQLITE_NOMEM;
-      if( n>0 ){
-        pEntry->pKey = sqlite3_malloc64((sqlite3_uint64)n);
-        if( pEntry->pKey==0 ) return SQLITE_NOMEM;
-        memcpy(pEntry->pKey, z, (size_t)n);
-      }
-      pEntry->nKey = n;
-      break;
-    }
-    default: {
-      const void *a = sqlite3_value_blob(pKey);
-      int n = sqlite3_value_bytes(pKey);
-      pEntry->eKeyType = SQLITE_BLOB;
-      if( a==0 && n>0 ) return SQLITE_NOMEM;
-      if( n>0 ){
-        pEntry->pKey = sqlite3_malloc64((sqlite3_uint64)n);
-        if( pEntry->pKey==0 ) return SQLITE_NOMEM;
-        memcpy(pEntry->pKey, a, (size_t)n);
-      }
-      pEntry->nKey = n;
-      break;
-    }
-  }
-  return SQLITE_OK;
-}
-
-static void columnarGroupKeyClear(ColumnarGroupEntry *pEntry){
-  if( pEntry->eKeyType==SQLITE_TEXT || pEntry->eKeyType==SQLITE_BLOB ){
-    sqlite3_free(pEntry->pKey);
-  }
-  pEntry->pKey = 0;
-  pEntry->nKey = 0;
+static void columnarGroupEntryClear(ColumnarGroupEntry *pEntry){
+  columnarValueClear(&pEntry->sKey);
+  columnarValueClear(&pEntry->sMin);
+  columnarValueClear(&pEntry->sMax);
 }
 
 static void columnarGroupEntriesClear(ColumnarGroupCursor *pCur){
@@ -1957,7 +2643,7 @@ static void columnarGroupEntriesClear(ColumnarGroupCursor *pCur){
   if( pCur->aEntry ){
     for(i=0; i<pCur->nAlloc; i++){
       if( pCur->aEntry[i].bUsed ){
-        columnarGroupKeyClear(&pCur->aEntry[i]);
+        columnarGroupEntryClear(&pCur->aEntry[i]);
       }
     }
     sqlite3_free(pCur->aEntry);
@@ -1991,18 +2677,26 @@ static int columnarGroupGrow(ColumnarGroupCursor *pCur){
   return SQLITE_OK;
 }
 
-static int columnarGroupAdd(ColumnarGroupCursor *pCur, const ColumnarGroupAgg *pAgg, sqlite3_value *pKey, double rVal1, int bVal1, double rVal2, int bVal2, int bCountStar){
+/* Fold one row into the hash table.  pVal1/pVal2 are the raw aggregate inputs,
+** or NULL when this aggregate takes no such argument; bCountStar asks
+** COLUMNAR_GROUP_COUNT to count rows rather than non-NULL values.
+*/
+static int columnarGroupAdd(ColumnarGroupCursor *pCur, const ColumnarGroupAgg *pAgg, sqlite3_value *pKey, sqlite3_value *pVal1, sqlite3_value *pVal2, int bCountStar){
   ColumnarGroupEntry *pEntry;
   unsigned int h;
   unsigned int uKeyHash = columnarGroupKeyHash(pKey);
+  int bVal1 = pVal1!=0 && sqlite3_value_type(pVal1)!=SQLITE_NULL;
+  int bVal2 = pVal2!=0 && sqlite3_value_type(pVal2)!=SQLITE_NULL;
+  int rc;
+
   if( pCur->nEntry*2 >= pCur->nAlloc ){
-    int rc = columnarGroupGrow(pCur);
+    rc = columnarGroupGrow(pCur);
     if( rc!=SQLITE_OK ) return rc;
   }
   h = uKeyHash & (unsigned int)(pCur->nAlloc-1);
   while( pCur->aEntry[h].bUsed ){
     if( pCur->aEntry[h].uKeyHash==uKeyHash
-     && columnarGroupKeyEqual(&pCur->aEntry[h], pKey)
+     && columnarValueEqual(&pCur->aEntry[h].sKey, pKey)
     ){
       pEntry = &pCur->aEntry[h];
       goto group_add_value;
@@ -2012,12 +2706,11 @@ static int columnarGroupAdd(ColumnarGroupCursor *pCur, const ColumnarGroupAgg *p
   pEntry = &pCur->aEntry[h];
   pEntry->bUsed = 1;
   pEntry->uKeyHash = uKeyHash;
-  {
-    int rc = columnarGroupKeySave(pEntry, pKey);
-    if( rc!=SQLITE_OK ){
-      memset(pEntry, 0, sizeof(*pEntry));
-      return rc;
-    }
+  columnarSumInit(&pEntry->sSum);
+  rc = columnarValueSave(&pEntry->sKey, pKey);
+  if( rc!=SQLITE_OK ){
+    memset(pEntry, 0, sizeof(*pEntry));
+    return rc;
   }
   pCur->nEntry++;
 
@@ -2030,52 +2723,70 @@ group_add_value:
     case COLUMNAR_GROUP_AVG:
     case COLUMNAR_GROUP_SUM_AVG_COUNT:
       if( bVal1 ){
-        pEntry->rSum += rVal1;
+        columnarSumAddValue(&pEntry->sSum, pVal1);
         pEntry->nCount++;
       }
       break;
     case COLUMNAR_GROUP_MIN:
       if( bVal1 ){
-        if( !pEntry->bMin || rVal1<pEntry->rMin ){
-          pEntry->rMin = rVal1;
-          pEntry->bMin = 1;
+        if( pEntry->sMin.eType==0
+         || columnarValueCompare(&pEntry->sMin, pVal1)>0
+        ){
+          columnarValueClear(&pEntry->sMin);
+          rc = columnarValueSave(&pEntry->sMin, pVal1);
+          if( rc!=SQLITE_OK ) return rc;
         }
         pEntry->nCount++;
       }
       break;
     case COLUMNAR_GROUP_MIN_MAX_COUNT:
       if( bVal1 ){
-        if( !pEntry->bMin || rVal1<pEntry->rMin ){
-          pEntry->rMin = rVal1;
-          pEntry->bMin = 1;
+        if( pEntry->sMin.eType==0
+         || columnarValueCompare(&pEntry->sMin, pVal1)>0
+        ){
+          columnarValueClear(&pEntry->sMin);
+          rc = columnarValueSave(&pEntry->sMin, pVal1);
+          if( rc!=SQLITE_OK ) return rc;
         }
-        if( !pEntry->bMax || rVal1>pEntry->rMax ){
-          pEntry->rMax = rVal1;
-          pEntry->bMax = 1;
+        if( pEntry->sMax.eType==0
+         || columnarValueCompare(&pEntry->sMax, pVal1)<0
+        ){
+          columnarValueClear(&pEntry->sMax);
+          rc = columnarValueSave(&pEntry->sMax, pVal1);
+          if( rc!=SQLITE_OK ) return rc;
         }
         pEntry->nCount++;
       }
       break;
     case COLUMNAR_GROUP_MAX:
       if( bVal1 ){
-        if( !pEntry->bMax || rVal1>pEntry->rMax ){
-          pEntry->rMax = rVal1;
-          pEntry->bMax = 1;
+        if( pEntry->sMax.eType==0
+         || columnarValueCompare(&pEntry->sMax, pVal1)<0
+        ){
+          columnarValueClear(&pEntry->sMax);
+          rc = columnarValueSave(&pEntry->sMax, pVal1);
+          if( rc!=SQLITE_OK ) return rc;
         }
         pEntry->nCount++;
       }
       break;
     case COLUMNAR_GROUP_RANGE:
       if( bVal1 ){
-        if( !pEntry->bMax || rVal1>pEntry->rMax ){
-          pEntry->rMax = rVal1;
-          pEntry->bMax = 1;
+        if( pEntry->sMax.eType==0
+         || columnarValueCompare(&pEntry->sMax, pVal1)<0
+        ){
+          columnarValueClear(&pEntry->sMax);
+          rc = columnarValueSave(&pEntry->sMax, pVal1);
+          if( rc!=SQLITE_OK ) return rc;
         }
       }
       if( bVal2 ){
-        if( !pEntry->bMin || rVal2<pEntry->rMin ){
-          pEntry->rMin = rVal2;
-          pEntry->bMin = 1;
+        if( pEntry->sMin.eType==0
+         || columnarValueCompare(&pEntry->sMin, pVal2)>0
+        ){
+          columnarValueClear(&pEntry->sMin);
+          rc = columnarValueSave(&pEntry->sMin, pVal2);
+          if( rc!=SQLITE_OK ) return rc;
         }
       }
       if( bVal1 || bVal2 ) pEntry->nCount++;
@@ -2240,12 +2951,8 @@ static int columnarGroupBuild(ColumnarGroupCursor *pCur, sqlite3 *db, const Colu
       rc = SQLITE_CORRUPT;
       break;
     }
-    {
-      int bVal1 = pVal1!=0 && sqlite3_column_type(pVal1, 1)!=SQLITE_NULL;
-      int bVal2 = pVal2!=0 && sqlite3_column_type(pVal2, 1)!=SQLITE_NULL;
-      rc = columnarGroupAdd(pCur, pAgg, sqlite3_column_value(pKey, 1), bVal1 ? sqlite3_column_double(pVal1, 1) : 0.0, bVal1, bVal2 ? sqlite3_column_double(pVal2, 1) : 0.0, bVal2, pVal1==0);
-      if( rc!=SQLITE_OK ) break;
-    }
+    rc = columnarGroupAdd(pCur, pAgg, sqlite3_column_value(pKey, 1), pVal1 ? sqlite3_column_value(pVal1, 1) : 0, pVal2 ? sqlite3_column_value(pVal2, 1) : 0, pVal1==0);
+    if( rc!=SQLITE_OK ) break;
   }
 
 group_build_done:
@@ -2275,6 +2982,7 @@ static int columnarGroupFilter(sqlite3_vtab_cursor *cur, int idxNum, const char 
   cur->pVtab = pVtab;
 
   if( argc<2+pAgg->nValArg ){
+    sqlite3_free(cur->pVtab->zErrMsg);
     cur->pVtab->zErrMsg = sqlite3_mprintf("%s requires table, key column%s%s", pAgg->zErrName, pAgg->nValArg>=1 ? ", and value column" : "", pAgg->nValArg>=2 ? "s" : "");
     return SQLITE_ERROR;
   }
@@ -2382,8 +3090,7 @@ static int columnarGroupWhereRunScan(sqlite3_stmt *pScan, int bChunked, sqlite3_
     sqlite3_bind_value(pScan, 2, pHi);
   }
   while( (rc = sqlite3_step(pScan))==SQLITE_ROW ){
-    int bVal = sqlite3_column_type(pScan, 1)!=SQLITE_NULL;
-    rc = columnarGroupAdd(pCur, pAgg, sqlite3_column_value(pScan, 0), bVal ? sqlite3_column_double(pScan, 1) : 0.0, bVal, 0.0, 0, 0);
+    rc = columnarGroupAdd(pCur, pAgg, sqlite3_column_value(pScan, 0), sqlite3_column_value(pScan, 1), 0, 0);
     if( rc!=SQLITE_OK ) return rc;
   }
   return rc==SQLITE_DONE ? SQLITE_OK : rc;
@@ -2396,8 +3103,7 @@ static int columnarGroupWhereRunFullScan(sqlite3_stmt *pScan, sqlite3_int64 iRid
   sqlite3_bind_int64(pScan, 1, iRidMin);
   sqlite3_bind_int64(pScan, 2, iRidMax);
   while( (rc = sqlite3_step(pScan))==SQLITE_ROW ){
-    int bVal = sqlite3_column_type(pScan, 1)!=SQLITE_NULL;
-    rc = columnarGroupAdd(pCur, pAgg, sqlite3_column_value(pScan, 0), bVal ? sqlite3_column_double(pScan, 1) : 0.0, bVal, 0.0, 0, 0);
+    rc = columnarGroupAdd(pCur, pAgg, sqlite3_column_value(pScan, 0), sqlite3_column_value(pScan, 1), 0, 0);
     if( rc!=SQLITE_OK ) return rc;
   }
   return rc==SQLITE_DONE ? SQLITE_OK : rc;
@@ -2409,8 +3115,10 @@ static int columnarGroupBuildWhereRange(ColumnarGroupCursor *pCur, sqlite3 *db, 
   sqlite3_stmt *pFullScan = 0;
   sqlite3_int64 nChunk = 0;
   sqlite3_int64 nDirty = 0;
+  ColumnarZoneBounds sZone;
   int rc;
 
+  memset(&sZone, 0, sizeof(sZone));
   rc = columnarDirtyCountForColumn(db, pRef, iKeyCol, &nDirty);
   if( rc!=SQLITE_OK ) return rc;
   if( nDirty==0 ){
@@ -2431,7 +3139,12 @@ static int columnarGroupBuildWhereRange(ColumnarGroupCursor *pCur, sqlite3 *db, 
   }
 
   rc = columnarChunkCountForColumn(db, pRef, iFilterCol, &nChunk);
-  if( rc!=SQLITE_OK || nChunk==0 ){
+  if( rc==SQLITE_OK && nChunk>0 ){
+    rc = columnarZoneBoundsInit(db, pRef, iFilterCol, pLo, pHi, &sZone);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+  if( rc!=SQLITE_OK || nChunk==0 || !sZone.bUsable ){
+    columnarZoneBoundsClear(&sZone);
     rc = columnarGroupWhereOpenScan(db, &pScan, pRef, iKeyCol, iValCol, iFilterCol, 0);
     if( rc==SQLITE_OK ){
       rc = columnarGroupWhereRunScan(pScan, 0, 0, 0, pLo, pHi, pCur, pAgg);
@@ -2441,10 +3154,13 @@ static int columnarGroupBuildWhereRange(ColumnarGroupCursor *pCur, sqlite3 *db, 
   }
 
   rc = columnarPrepare(db, &pChunk, 0, "SELECT rid_min,rid_max," " (nonnull_count=row_count AND min>=?2 AND max<=?3)" " FROM \"%w\".\"%w__columnar_chunk\"" " WHERE col=?1 AND min IS NOT NULL AND max>=?2 AND min<=?3" " ORDER BY chunk", pRef->zDb, pRef->zTab);
-  if( rc!=SQLITE_OK ) return rc;
+  if( rc!=SQLITE_OK ){
+    columnarZoneBoundsClear(&sZone);
+    return rc;
+  }
   sqlite3_bind_int(pChunk, 1, iFilterCol);
-  sqlite3_bind_value(pChunk, 2, pLo);
-  sqlite3_bind_value(pChunk, 3, pHi);
+  sqlite3_bind_value(pChunk, 2, sZone.pLo);
+  sqlite3_bind_value(pChunk, 3, sZone.pHi);
 
   rc = columnarGroupWhereOpenScan(db, &pScan, pRef, iKeyCol, iValCol, iFilterCol, 1);
   if( rc!=SQLITE_OK ) goto group_where_done;
@@ -2461,6 +3177,7 @@ static int columnarGroupBuildWhereRange(ColumnarGroupCursor *pCur, sqlite3 *db, 
   if( rc==SQLITE_DONE ) rc = SQLITE_OK;
 
 group_where_done:
+  columnarZoneBoundsClear(&sZone);
   sqlite3_finalize(pChunk);
   sqlite3_finalize(pScan);
   sqlite3_finalize(pFullScan);
@@ -2485,6 +3202,7 @@ static int columnarGroupWhereFilter(sqlite3_vtab_cursor *cur, int idxNum, const 
 
   columnarGroupEntriesClear(pCur);
   if( argc<6 ){
+    sqlite3_free(cur->pVtab->zErrMsg);
     cur->pVtab->zErrMsg = sqlite3_mprintf("%s requires table, key column, value column, filter column, low, and high", pAgg->zErrName);
     return SQLITE_ERROR;
   }
@@ -2534,41 +3252,17 @@ static int columnarGroupColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx, i
   }
   pEntry = &pCur->aEntry[pCur->iEntry];
   if( i==0 ){
-    switch( pEntry->eKeyType ){
-      case SQLITE_NULL:
-        sqlite3_result_null(ctx);
-        break;
-      case SQLITE_INTEGER:
-        sqlite3_result_int64(ctx, pEntry->iKey);
-        break;
-      case SQLITE_FLOAT:
-        sqlite3_result_double(ctx, pEntry->rKey);
-        break;
-      case SQLITE_TEXT:
-        sqlite3_result_text(ctx, (const char*)pEntry->pKey, pEntry->nKey, SQLITE_TRANSIENT);
-        break;
-      default:
-        sqlite3_result_blob(ctx, pEntry->pKey, pEntry->nKey, SQLITE_TRANSIENT);
-        break;
-    }
+    columnarValueResult(ctx, &pEntry->sKey);
     return SQLITE_OK;
   }
   switch( pAgg->eOp ){
     case COLUMNAR_GROUP_SUM:
-      if( i==1 ){
-        if( pEntry->nCount==0 ) sqlite3_result_null(ctx);
-        else sqlite3_result_double(ctx, pEntry->rSum);
-      }else{
-        sqlite3_result_null(ctx);
-      }
+      if( i==1 ) columnarSumResult(ctx, &pEntry->sSum);
+      else sqlite3_result_null(ctx);
       break;
     case COLUMNAR_GROUP_AVG:
-      if( i==1 ){
-        if( pEntry->nCount==0 ) sqlite3_result_null(ctx);
-        else sqlite3_result_double(ctx, pEntry->rSum/(double)pEntry->nCount);
-      }else{
-        sqlite3_result_null(ctx);
-      }
+      if( i==1 ) columnarAvgResult(ctx, &pEntry->sSum);
+      else sqlite3_result_null(ctx);
       break;
     case COLUMNAR_GROUP_COUNT:
       if( i==1 ) sqlite3_result_int64(ctx, pEntry->nCount);
@@ -2576,11 +3270,9 @@ static int columnarGroupColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx, i
       break;
     case COLUMNAR_GROUP_SUM_AVG_COUNT:
       if( i==1 ){
-        if( pEntry->nCount==0 ) sqlite3_result_null(ctx);
-        else sqlite3_result_double(ctx, pEntry->rSum);
+        columnarSumResult(ctx, &pEntry->sSum);
       }else if( i==2 ){
-        if( pEntry->nCount==0 ) sqlite3_result_null(ctx);
-        else sqlite3_result_double(ctx, pEntry->rSum/(double)pEntry->nCount);
+        columnarAvgResult(ctx, &pEntry->sSum);
       }else if( i==3 ){
         sqlite3_result_int64(ctx, pEntry->nCount);
       }else{
@@ -2588,26 +3280,31 @@ static int columnarGroupColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx, i
       }
       break;
     case COLUMNAR_GROUP_MIN:
-      if( i==1 && pEntry->bMin ) sqlite3_result_double(ctx, pEntry->rMin);
+      if( i==1 ) columnarValueResult(ctx, &pEntry->sMin);
       else sqlite3_result_null(ctx);
       break;
     case COLUMNAR_GROUP_MAX:
-      if( i==1 && pEntry->bMax ) sqlite3_result_double(ctx, pEntry->rMax);
+      if( i==1 ) columnarValueResult(ctx, &pEntry->sMax);
       else sqlite3_result_null(ctx);
       break;
     case COLUMNAR_GROUP_MIN_MAX_COUNT:
-      if( i==1 && pEntry->bMin ) sqlite3_result_double(ctx, pEntry->rMin);
-      else if( i==2 && pEntry->bMax ) sqlite3_result_double(ctx, pEntry->rMax);
+      if( i==1 ) columnarValueResult(ctx, &pEntry->sMin);
+      else if( i==2 ) columnarValueResult(ctx, &pEntry->sMax);
       else if( i==3 ) sqlite3_result_int64(ctx, pEntry->nCount);
       else sqlite3_result_null(ctx);
       break;
     case COLUMNAR_GROUP_RANGE:
-      if( i==1 && pEntry->bMax && pEntry->bMin ){
-        sqlite3_result_double(ctx, pEntry->rMax - pEntry->rMin);
-      }else if( i==2 && pEntry->bMax ){
-        sqlite3_result_double(ctx, pEntry->rMax);
-      }else if( i==3 && pEntry->bMin ){
-        sqlite3_result_double(ctx, pEntry->rMin);
+      if( i==1 ){
+        if( pEntry->sMax.eType!=0 && pEntry->sMin.eType!=0 ){
+          /* max-min, with the same numeric coercion SQL arithmetic applies. */
+          sqlite3_result_double(ctx, pEntry->sMax.rNum - pEntry->sMin.rNum);
+        }else{
+          sqlite3_result_null(ctx);
+        }
+      }else if( i==2 ){
+        columnarValueResult(ctx, &pEntry->sMax);
+      }else if( i==3 ){
+        columnarValueResult(ctx, &pEntry->sMin);
       }else if( i==4 ){
         sqlite3_result_int64(ctx, pEntry->nCount);
       }else{
