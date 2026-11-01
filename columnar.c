@@ -34,7 +34,7 @@ SQLITE_EXTENSION_INIT1
 #endif
 
 #ifndef COLUMNAR_VERSION
-# define COLUMNAR_VERSION "1.1.0"
+# define COLUMNAR_VERSION "1.1.1"
 #endif
 
 #ifndef SQLITE_OMIT_VIRTUALTABLE
@@ -50,7 +50,6 @@ typedef struct ColumnarGroupEntry ColumnarGroupEntry;
 typedef struct ColumnarTableRef ColumnarTableRef;
 typedef struct ColumnarValue ColumnarValue;
 typedef struct ColumnarSum ColumnarSum;
-typedef struct ColumnarZoneBounds ColumnarZoneBounds;
 
 static sqlite3_module columnarModule;
 static sqlite3_module columnarGroupModule;
@@ -139,15 +138,6 @@ struct ColumnarSum {
   double rSum;               /* Compensated sum; add rErr for the result */
   double rErr;
   int bInt;
-};
-
-/* Range bounds prepared for comparison against a chunk zone map. */
-struct ColumnarZoneBounds {
-  sqlite3_value *pLo;        /* Bound to bind; may alias the caller's value */
-  sqlite3_value *pHi;
-  sqlite3_value *pLoOwned;   /* Converted copies this struct must free */
-  sqlite3_value *pHiOwned;
-  int bUsable;               /* False when the zone map cannot be trusted */
 };
 
 struct ColumnarGroupEntry {
@@ -1217,24 +1207,17 @@ static void columnarSumAddValue(ColumnarSum *p, sqlite3_value *pVal){
     case SQLITE_FLOAT:
       columnarSumAddDouble(p, sqlite3_value_double(pVal), 1);
       break;
-    default: {
-      /* sum() applies numeric affinity before accumulating, so text holding a
-      ** plain integer keeps the exact accumulator alive just as it does in
-      ** SQL.  sqlite3_value_dup() hands back a protected copy, which is what
-      ** makes it safe to convert one taken from a statement column. */
-      sqlite3_value *pNum = sqlite3_value_dup(pVal);
-      if( pNum==0 ){
-        columnarSumAddDouble(p, sqlite3_value_double(pVal), 1);
-      }else{
-        if( sqlite3_value_numeric_type(pNum)==SQLITE_INTEGER ){
-          columnarSumAddInt(p, sqlite3_value_int64(pNum), 1);
-        }else{
-          columnarSumAddDouble(p, sqlite3_value_double(pNum), 1);
-        }
-        sqlite3_value_free(pNum);
-      }
+    default:
+      /* Text or a blob.  sum() applies numeric affinity before accumulating,
+      ** so text holding a plain integer would keep an exact accumulator;
+      ** finding that out here needs a numeric-affinity conversion of a copy,
+      ** and that combination is not safe across SQLite versions, so take the
+      ** floating point path.  The total is the same either way -- only its
+      ** storage class differs, and only for numeric text in a column with no
+      ** declared affinity, since a numeric column converts such text as it is
+      ** stored. */
+      columnarSumAddDouble(p, sqlite3_value_double(pVal), 1);
       break;
-    }
   }
 }
 
@@ -1323,63 +1306,40 @@ static int columnarColumnAffinity(sqlite3 *db, const ColumnarTableRef *pRef, int
   return rc;
 }
 
-/* Convert one bound for comparison against the zone map's typeless min/max
-** columns.  Returns 0 when the conversion cannot be expressed, which tells the
-** caller to skip the zone map and scan instead. */
-static int columnarZoneBound(int eAff, sqlite3_value *pVal, sqlite3_value **ppOut, sqlite3_value **ppOwned, int *pRc){
+/* True if a bound can be compared against the zone map exactly as it stands.
+**
+** A comparison against the real column applies that column's affinity to the
+** bound first.  The zone map's min/max columns are typeless, so they cannot
+** express that conversion, and converting the bound here is not an option: it
+** would mean reimplementing SQLite's own numeric-affinity rules, and doing it
+** by duplicating the value and converting the copy is not safe across SQLite
+** versions -- that combination crashes on some builds, and a loadable
+** extension runs against whatever version the host provides.
+**
+** So when a bound would need converting, report the zone map as unusable and
+** let the caller scan instead.  The scan compares against the shadow column,
+** where SQLite applies the affinity itself, so the answer stays correct; only
+** the chunk-skipping optimization is given up, and only for a bound whose
+** type does not match the column it filters on.
+*/
+static int columnarZoneBoundUsable(int eAff, sqlite3_value *pVal){
   int eType = sqlite3_value_type(pVal);
-  *ppOut = pVal;
-  *ppOwned = 0;
   if( eAff==COLUMNAR_AFF_NONE || eType==SQLITE_NULL ) return 1;
   if( eAff==COLUMNAR_AFF_NUM ){
-    sqlite3_value *pNew;
-    if( eType!=SQLITE_TEXT && eType!=SQLITE_BLOB ) return 1;
-    pNew = sqlite3_value_dup(pVal);
-    if( pNew==0 ){
-      *pRc = SQLITE_NOMEM;
-      return 0;
-    }
-    /* Exactly the numeric affinity a comparison against this column applies. */
-    sqlite3_value_numeric_type(pNew);
-    *ppOut = pNew;
-    *ppOwned = pNew;
-    return 1;
+    return eType==SQLITE_INTEGER || eType==SQLITE_FLOAT;
   }
-  /* TEXT affinity would stringify a numeric bound; rather than reimplement
-  ** that here, fall back to the scan, whose comparison does it for us. */
-  return eType!=SQLITE_INTEGER && eType!=SQLITE_FLOAT;
+  return eType==SQLITE_TEXT || eType==SQLITE_BLOB;
 }
 
-static void columnarZoneBoundsClear(ColumnarZoneBounds *pZone){
-  sqlite3_value_free(pZone->pLoOwned);
-  sqlite3_value_free(pZone->pHiOwned);
-  pZone->pLoOwned = 0;
-  pZone->pHiOwned = 0;
-}
-
-/* Prepare lo/hi for the chunk zone map.  The zone map's min/max columns are
-** typeless but hold values that already carry the data column's affinity, so
-** the bounds need the same conversion the scan comparison would give them.
-** Without it an integer column queried with text bounds prunes every chunk. */
-static int columnarZoneBoundsInit(sqlite3 *db, const ColumnarTableRef *pRef, int iFilterCol, sqlite3_value *pLo, sqlite3_value *pHi, ColumnarZoneBounds *pZone){
+static int columnarZoneMapUsable(sqlite3 *db, const ColumnarTableRef *pRef, int iFilterCol, sqlite3_value *pLo, sqlite3_value *pHi, int *pbUsable){
   int eAff = COLUMNAR_AFF_NONE;
-  int rc = SQLITE_OK;
+  int rc;
 
-  memset(pZone, 0, sizeof(*pZone));
-  pZone->pLo = pLo;
-  pZone->pHi = pHi;
-  pZone->bUsable = 1;
+  *pbUsable = 0;
   rc = columnarColumnAffinity(db, pRef, iFilterCol, &eAff);
   if( rc!=SQLITE_OK ) return rc;
-  if( !columnarZoneBound(eAff, pLo, &pZone->pLo, &pZone->pLoOwned, &rc)
-   || !columnarZoneBound(eAff, pHi, &pZone->pHi, &pZone->pHiOwned, &rc)
-  ){
-    pZone->bUsable = 0;
-  }
-  if( rc!=SQLITE_OK ){
-    columnarZoneBoundsClear(pZone);
-    return rc;
-  }
+  *pbUsable = columnarZoneBoundUsable(eAff, pLo)
+           && columnarZoneBoundUsable(eAff, pHi);
   return SQLITE_OK;
 }
 
@@ -2475,10 +2435,9 @@ static int columnarRangeCompute(sqlite3 *db, const ColumnarTableRef *pRef, int i
   sqlite3_int64 nChunk = 0;
   sqlite3_int64 nDirtyFilter = 0;
   sqlite3_int64 nDirtyValue = 0;
-  ColumnarZoneBounds sZone;
+  int bZoneOk = 0;
   int rc;
 
-  memset(&sZone, 0, sizeof(sZone));
   columnarSumInit(pAcc);
   rc = columnarDirtyCountForColumn(db, pRef, iFilterCol, &nDirtyFilter);
   if( rc!=SQLITE_OK ) return rc;
@@ -2494,11 +2453,10 @@ static int columnarRangeCompute(sqlite3 *db, const ColumnarTableRef *pRef, int i
   }
   rc = columnarChunkCountForColumn(db, pRef, iFilterCol, &nChunk);
   if( rc==SQLITE_OK && nChunk>0 ){
-    rc = columnarZoneBoundsInit(db, pRef, iFilterCol, pLo, pHi, &sZone);
+    rc = columnarZoneMapUsable(db, pRef, iFilterCol, pLo, pHi, &bZoneOk);
     if( rc!=SQLITE_OK ) return rc;
   }
-  if( rc!=SQLITE_OK || nChunk==0 || !sZone.bUsable ){
-    columnarZoneBoundsClear(&sZone);
+  if( rc!=SQLITE_OK || nChunk==0 || !bZoneOk ){
     rc = columnarRangeOpenScan(db, &pScan, pRef, iValCol, iFilterCol, 0);
     if( rc==SQLITE_OK ){
       rc = columnarRangeRunScan(pScan, 0, 0, 0, pLo, pHi, eOp, pAcc);
@@ -2508,13 +2466,10 @@ static int columnarRangeCompute(sqlite3 *db, const ColumnarTableRef *pRef, int i
   }
 
   rc = columnarPrepare(db, &pChunk, 0, "SELECT f.rid_min,f.rid_max," " (f.nonnull_count=f.row_count AND f.min>=?2 AND f.max<=?3)," " v.nonnull_count,v.sum" " FROM \"%w\".\"%w__columnar_chunk\" AS f" " JOIN \"%w\".\"%w__columnar_chunk\" AS v" "   ON v.col=?4 AND v.chunk=f.chunk" " WHERE f.col=?1 AND f.min IS NOT NULL AND f.max>=?2 AND f.min<=?3" " ORDER BY f.chunk", pRef->zDb, pRef->zTab, pRef->zDb, pRef->zTab);
-  if( rc!=SQLITE_OK ){
-    columnarZoneBoundsClear(&sZone);
-    return rc;
-  }
+  if( rc!=SQLITE_OK ) return rc;
   sqlite3_bind_int(pChunk, 1, iFilterCol);
-  sqlite3_bind_value(pChunk, 2, sZone.pLo);
-  sqlite3_bind_value(pChunk, 3, sZone.pHi);
+  sqlite3_bind_value(pChunk, 2, pLo);
+  sqlite3_bind_value(pChunk, 3, pHi);
   sqlite3_bind_int(pChunk, 4, iValCol);
 
   rc = columnarRangeOpenScan(db, &pScan, pRef, iValCol, iFilterCol, 1);
@@ -2531,7 +2486,6 @@ static int columnarRangeCompute(sqlite3 *db, const ColumnarTableRef *pRef, int i
   if( rc==SQLITE_DONE ) rc = SQLITE_OK;
 
 range_compute_done:
-  columnarZoneBoundsClear(&sZone);
   sqlite3_finalize(pChunk);
   sqlite3_finalize(pScan);
   return rc;
@@ -3115,10 +3069,9 @@ static int columnarGroupBuildWhereRange(ColumnarGroupCursor *pCur, sqlite3 *db, 
   sqlite3_stmt *pFullScan = 0;
   sqlite3_int64 nChunk = 0;
   sqlite3_int64 nDirty = 0;
-  ColumnarZoneBounds sZone;
+  int bZoneOk = 0;
   int rc;
 
-  memset(&sZone, 0, sizeof(sZone));
   rc = columnarDirtyCountForColumn(db, pRef, iKeyCol, &nDirty);
   if( rc!=SQLITE_OK ) return rc;
   if( nDirty==0 ){
@@ -3140,11 +3093,10 @@ static int columnarGroupBuildWhereRange(ColumnarGroupCursor *pCur, sqlite3 *db, 
 
   rc = columnarChunkCountForColumn(db, pRef, iFilterCol, &nChunk);
   if( rc==SQLITE_OK && nChunk>0 ){
-    rc = columnarZoneBoundsInit(db, pRef, iFilterCol, pLo, pHi, &sZone);
+    rc = columnarZoneMapUsable(db, pRef, iFilterCol, pLo, pHi, &bZoneOk);
     if( rc!=SQLITE_OK ) return rc;
   }
-  if( rc!=SQLITE_OK || nChunk==0 || !sZone.bUsable ){
-    columnarZoneBoundsClear(&sZone);
+  if( rc!=SQLITE_OK || nChunk==0 || !bZoneOk ){
     rc = columnarGroupWhereOpenScan(db, &pScan, pRef, iKeyCol, iValCol, iFilterCol, 0);
     if( rc==SQLITE_OK ){
       rc = columnarGroupWhereRunScan(pScan, 0, 0, 0, pLo, pHi, pCur, pAgg);
@@ -3154,13 +3106,10 @@ static int columnarGroupBuildWhereRange(ColumnarGroupCursor *pCur, sqlite3 *db, 
   }
 
   rc = columnarPrepare(db, &pChunk, 0, "SELECT rid_min,rid_max," " (nonnull_count=row_count AND min>=?2 AND max<=?3)" " FROM \"%w\".\"%w__columnar_chunk\"" " WHERE col=?1 AND min IS NOT NULL AND max>=?2 AND min<=?3" " ORDER BY chunk", pRef->zDb, pRef->zTab);
-  if( rc!=SQLITE_OK ){
-    columnarZoneBoundsClear(&sZone);
-    return rc;
-  }
+  if( rc!=SQLITE_OK ) return rc;
   sqlite3_bind_int(pChunk, 1, iFilterCol);
-  sqlite3_bind_value(pChunk, 2, sZone.pLo);
-  sqlite3_bind_value(pChunk, 3, sZone.pHi);
+  sqlite3_bind_value(pChunk, 2, pLo);
+  sqlite3_bind_value(pChunk, 3, pHi);
 
   rc = columnarGroupWhereOpenScan(db, &pScan, pRef, iKeyCol, iValCol, iFilterCol, 1);
   if( rc!=SQLITE_OK ) goto group_where_done;
@@ -3177,7 +3126,6 @@ static int columnarGroupBuildWhereRange(ColumnarGroupCursor *pCur, sqlite3 *db, 
   if( rc==SQLITE_DONE ) rc = SQLITE_OK;
 
 group_where_done:
-  columnarZoneBoundsClear(&sZone);
   sqlite3_finalize(pChunk);
   sqlite3_finalize(pScan);
   sqlite3_finalize(pFullScan);

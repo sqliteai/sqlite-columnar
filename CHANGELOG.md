@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.1.1] - 2026-11-01
+
+### Fixed
+
+- **Fixed a crash in the range helpers and in sums over text, when loaded
+  against SQLite 3.53.2 or later.** Both paths converted a value by duplicating
+  it with `sqlite3_value_dup()` and applying numeric affinity to the copy with
+  `sqlite3_value_numeric_type()`. That combination segfaults on newer SQLite
+  builds, and a loadable extension runs against whatever version the host
+  provides, so neither path may rely on it. Isolated from this extension, the
+  same two calls crash on 3.53.4 and succeed on 3.53.1.
+  - The chunk zone map is now skipped, in favour of a plain scan, when a bound's
+    storage class differs from the one its filter column stores. Results are
+    unchanged; only the chunk-skipping optimization is given up for that shape.
+  - Sums over text that `sum()` would read as a number now use the floating
+    point accumulator. The total is unchanged; only its storage class differs,
+    and only for a column declared with no type.
+
 ## [1.1.0] - 2026-11-01
 
 ### Security

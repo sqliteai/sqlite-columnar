@@ -247,3 +247,39 @@ SELECT 'quoted-keyword-is-column', CASE WHEN
 -- A table of nothing but constraints declares no column and must be refused.
 SELECT 'no-columns-refused', CASE WHEN NOT EXISTS(
     SELECT 1 FROM sqlite_master WHERE name='tc_bad') THEN 'ok' ELSE 'MISMATCH' END;
+
+-- The zone map's min/max columns are typeless, so a bound whose type does not
+-- match its filter column cannot be compared against them. The answer must
+-- still match ordinary SQL; only the chunk-skipping optimization is skipped.
+CREATE VIRTUAL TABLE zb USING columnar(v REAL, f INTEGER, t TEXT);
+INSERT INTO zb VALUES(1.0,5,'aa'),(2.0,15,'mm'),(3.0,25,'zz');
+SELECT 'zone-analyze', columnar_analyze('zb');
+SELECT 'zone-text-bound-on-numeric-col', CASE WHEN
+      columnar_count_where_range('zb','v','f','10','20')
+    = (SELECT count(v) FROM zb WHERE f BETWEEN '10' AND '20')
+  AND quote(columnar_sum_where_range('zb','v','f','10','20'))
+    = quote((SELECT sum(v) FROM zb WHERE f BETWEEN '10' AND '20'))
+  THEN 'ok' ELSE 'MISMATCH' END;
+SELECT 'zone-numeric-bound-on-text-col', CASE WHEN
+      columnar_count_where_range('zb','v','t',10,20)
+    = (SELECT count(v) FROM zb WHERE t BETWEEN 10 AND 20)
+  THEN 'ok' ELSE 'MISMATCH' END;
+SELECT 'zone-matching-bound-types', CASE WHEN
+      columnar_count_where_range('zb','v','f',10,20)
+    = (SELECT count(v) FROM zb WHERE f BETWEEN 10 AND 20)
+  AND columnar_count_where_range('zb','v','t','a','n')
+    = (SELECT count(v) FROM zb WHERE t BETWEEN 'a' AND 'n')
+  THEN 'ok' ELSE 'MISMATCH' END;
+
+-- Summing numeric text held in a column with no declared affinity gives the
+-- right total with a real storage class, where sum() returns an integer. A
+-- column with a numeric affinity converts such text as it is stored, so this
+-- only arises for an untyped column.
+CREATE VIRTUAL TABLE st USING columnar(a, b INTEGER);
+INSERT INTO st VALUES('10',' 10'),(5,5);
+SELECT 'untyped-numeric-text-value', CASE WHEN
+      columnar_sum('st','a') = (SELECT sum(a) FROM st)
+  THEN 'ok' ELSE 'MISMATCH' END;
+SELECT 'typed-col-converts-on-store', CASE WHEN
+      quote(columnar_sum('st','b')) = quote((SELECT sum(b) FROM st))
+  THEN 'ok' ELSE 'MISMATCH' END;

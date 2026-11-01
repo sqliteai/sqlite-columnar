@@ -300,7 +300,15 @@ SELECT k, "sum", "avg", "count"
   get depends on the query plan.
 - `columnar_sum()` and the grouped sums return an integer when every value
   summed is an integer, matching `sum()`. They fall back to a floating point
-  result if the exact total would overflow, where `sum()` raises an error.
+  result if the exact total would overflow, where `sum()` raises an error, and
+  also when the column holds text that `sum()` would read as a number -- the
+  total is the same, only its storage class differs. A column with a numeric
+  declared type converts such text as it is stored, so this applies only to a
+  column declared with no type.
+- The `*_where_range()` helpers skip the chunk zone map, and scan instead, when
+  a bound's storage class differs from the one its filter column stores -- for
+  example a text bound against an `INTEGER` column. The result is the same;
+  only the chunk-skipping optimization is given up.
 - `columnar_group_min()`, `columnar_group_max()`, `columnar_group_min_max_count()`
   and the `"min"`/`"max"` columns of `columnar_group_range()` compare values in
   SQLite's own sort order and preserve their storage class, so text and blob
